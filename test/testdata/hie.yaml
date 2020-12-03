@@ -5,6 +5,7 @@ cradle:
       - "CodeActionOnly"
       - "CodeActionRename"
       - "Highlight"
+      - "Symbols"
       - "TopLevelSignature"
       - "TypedHoles"
       - "TypedHoles2"
