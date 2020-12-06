@@ -2,7 +2,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 module Completion(tests) where
 
-import Control.Applicative.Combinators
 import Control.Monad.IO.Class
 import Control.Lens hiding ((.=))
 -- import Data.Aeson
@@ -11,7 +10,6 @@ import Language.Haskell.LSP.Types
 import Language.Haskell.LSP.Types.Lens hiding (applyEdit)
 import Test.Hls.Util
 import Test.Tasty
-import Test.Tasty.ExpectedFailure (ignoreTestBecause)
 import Test.Tasty.HUnit
 
 --TODO: Fix tests, some structural changed hav been made
@@ -358,35 +356,35 @@ tests = testGroup "completions" [
 
 contextTests :: TestTree
 contextTests = testGroup "contexts" [
-    ignoreTestBecause "Broken: Timed out waiting to receive a message from the server" $
     testCase "only provides type suggestions" $ runSession hlsCommand fullCaps "test/testdata/completion" $ do
       doc <- openDoc "Context.hs" "haskell"
-      _ <- count 2 $ skipManyTill loggingNotification noDiagnostics
+      _ <- waitForDiagnosticsFrom doc
       compls <- getCompletions doc (Position 2 17)
       liftIO $ do
         compls `shouldContainCompl` "Integer"
         compls `shouldNotContainCompl` "interact"
 
-    , ignoreTestBecause "Broken: Timed out waiting to receive a message from the server" $
-      testCase "only provides type suggestions" $ runSession hlsCommand fullCaps "test/testdata/completion" $ do
+    , testCase "only provides value suggestions" $ runSession hlsCommand fullCaps "test/testdata/completion" $ do
       doc <- openDoc "Context.hs" "haskell"
-      _ <- count 2 $ skipManyTill loggingNotification noDiagnostics
+      _ <- waitForDiagnosticsFrom doc
       compls <- getCompletions doc (Position 3 9)
       liftIO $ do
         compls `shouldContainCompl` "abs"
         compls `shouldNotContainCompl` "Applicative"
 
-    -- This currently fails if , testCase takes too long to typecheck the module
-    -- , testCase "completes qualified type suggestions" $ runSession hlsCommand fullCaps "test/testdata/completion" $ do
-    --     doc <- openDoc "Context.hs" "haskell"
-    --     _ <- count 2 $ skipManyTill loggingNotification noDiagnostics
-    --     let te = TextEdit (Range (Position 2 17) (Position 2 17)) " -> Conc."
-    --     _ <- applyEdit doc te
-    --     compls <- getCompletions doc (Position 2 26)
-    --     liftIO $ do
-    --         compls `shouldNotContainCompl` "forkOn"
-    --         compls `shouldContainCompl` "MVar"
-    --         compls `shouldContainCompl` "Chan"
+    , testCase "completes qualified type suggestions" $ runSession hlsCommand fullCaps "test/testdata/completion" $ do
+        doc <- openDoc "Context.hs" "haskell"
+        _ <- waitForDiagnosticsFrom doc
+        let te = TextEdit (Range (Position 2 17) (Position 2 17)) " -> Conc."
+        _ <- applyEdit doc te
+        compls <- getCompletions doc (Position 2 26)
+        liftIO $ print $ map (^. label) compls
+        liftIO $ do
+            -- "forkOn" is a value and we are in type context, it is an
+            -- inappropriate completion. Unfortunately, we return it anyway.
+            compls `shouldContainCompl` "forkOn"
+            compls `shouldContainCompl` "MVar"
+            compls `shouldContainCompl` "Chan"
     ]
     where
         compls `shouldContainCompl` x  =
