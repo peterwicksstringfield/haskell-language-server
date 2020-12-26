@@ -14,13 +14,11 @@ import Test.Tasty.HUnit
 tests :: TestTree
 tests = testGroup "definitions" [
 
-       testCase "goto's symbols" $ runSession hlsCommand fullCaps "test/testdata" $ do
-        doc <- openDoc "References.hs" "haskell"
-        defs <- getDefinitions doc (Position 7 8)
-        let expRange = Range (Position 4 0) (Position 4 3)
-        liftIO $ defs @?= [Location (doc ^. uri) expRange]
-
-  -- -----------------------------------
+  testCase "goto's symbols" $ runSession hlsCommand fullCaps "test/testdata" $ do
+      doc <- openDoc "References.hs" "haskell"
+      defs <- getDefinitions doc (Position 7 8)
+      let expRange = Range (Position 4 0) (Position 4 3)
+      liftIO $ defs @?= [Location (doc ^. uri) expRange]
 
   , expectFailBecause "no cross module lookup" $
     testCase "goto's imported modules" $ runSession hlsCommand fullCaps "test/testdata/definition" $ do
