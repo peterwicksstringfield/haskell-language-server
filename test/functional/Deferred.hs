@@ -1,20 +1,18 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Deferred(tests) where
 
-import Control.Applicative.Combinators
+--import Control.Applicative.Combinators
 import Control.Monad.IO.Class
-import Control.Lens hiding (List)
--- import Control.Monad
--- import Data.Maybe
+import Control.Lens (_Just, (^?), _Right)
+import Data.Maybe (fromJust)
+import qualified Data.Set as Set
 import Language.Haskell.LSP.Test
 import Language.Haskell.LSP.Types
 import Language.Haskell.LSP.Types.Lens hiding (id, message)
 -- import qualified Language.Haskell.LSP.Types.Lens as LSP
 import Test.Hls.Util
 import Test.Tasty
-import Test.Tasty.ExpectedFailure (ignoreTestBecause)
+--import Test.Tasty.ExpectedFailure (ignoreTestBecause)
 import Test.Tasty.HUnit
 
 
@@ -137,40 +135,33 @@ tests = testGroup "deferred responses" [
         -- liftIO $ editReq ^. params . edit @?= WorkspaceEdit
         --       Nothing
         --       (Just expectedTextDocEdits)
-    -- , multiServerTests
+    , multiServerTests
     , multiMainTests
     ]
 
---TODO: Does not compile
--- multiServerTests :: TestTree
--- multiServerTests = testGroup "multi-server setup" [
---     testCase "doesn't have clashing commands on two servers" $ do
---         let getCommands = runSession hlsCommand fullCaps "test/testdata" $ do
---                 rsp <- initializeResponse
---                 let uuids = rsp ^? result . _Just . capabilities . executeCommandProvider . _Just . commands
---                 return $ fromJust uuids
---         List uuids1 <- getCommands
---         List uuids2 <- getCommands
---         liftIO $ forM_ (zip uuids1 uuids2) (uncurry shouldNotBe)
---     ]
+multiServerTests :: TestTree
+multiServerTests = testGroup "multi-server setup" [
+    testCase "doesn't have clashing commands on two servers" $ do
+        let getCommands = runSession hlsCommand fullCaps "test/testdata" $ do
+                rsp <- initializeResponse
+                let uuids = rsp ^? result . _Right . capabilities . executeCommandProvider . _Just . commands
+                return $ fromJust uuids
+        List uuids1 <- getCommands
+        List uuids2 <- getCommands
+        liftIO $ Set.empty @=? (Set.fromList uuids1 `Set.intersection` Set.fromList uuids2)
+    ]
 
 multiMainTests :: TestTree
 multiMainTests = testGroup "multiple main modules" [
-    ignoreTestBecause "Broken: Unexpected ConduitParser.empty" $
     testCase "Can load one file at a time, when more than one Main module exists"
         $ runSession hlsCommand fullCaps "test/testdata" $ do
-            _doc <- openDoc "ApplyRefact2.hs" "haskell"
-            _diagsRspHlint <- skipManyTill anyNotification message :: Session PublishDiagnosticsNotification
-            diagsRspGhc    <- skipManyTill anyNotification message :: Session PublishDiagnosticsNotification
-            let (List diags) = diagsRspGhc ^. params . diagnostics
+            doc <- openDoc "hlint/ApplyRefact2.hs" "haskell"
+            diags <- waitForDiagnosticsFromSource doc "hlint"
 
             liftIO $ length diags @?= 2
 
-            _doc2 <- openDoc "HaReRename.hs" "haskell"
-            _diagsRspHlint2 <- skipManyTill anyNotification message :: Session PublishDiagnosticsNotification
-            -- errMsg <- skipManyTill anyNotification notification :: Session ShowMessageNotification
-            diagsRsp2 <- skipManyTill anyNotification message :: Session PublishDiagnosticsNotification
-            let (List diags2) = diagsRsp2 ^. params . diagnostics
+            doc2 <- openDoc "FileWithWarning.hs" "haskell"
+            diags2 <- waitForDiagnosticsFromSource doc2 "typecheck"
 
-            liftIO $ show diags2 @?= "[]"
+            liftIO $ length diags2 @?= 1
     ]
