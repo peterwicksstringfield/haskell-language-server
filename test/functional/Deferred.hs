@@ -1,7 +1,7 @@
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Deferred(tests) where
 
---import Control.Applicative.Combinators
 import Control.Monad.IO.Class
 import Control.Lens (_Just, (^?), _Right)
 import Data.Maybe (fromJust)
@@ -9,7 +9,6 @@ import qualified Data.Set as Set
 import Language.Haskell.LSP.Test
 import Language.Haskell.LSP.Types
 import Language.Haskell.LSP.Types.Lens hiding (id, message)
--- import qualified Language.Haskell.LSP.Types.Lens as LSP
 import Test.Hls.Util
 import Test.Tasty
 --import Test.Tasty.ExpectedFailure (ignoreTestBecause)
@@ -19,77 +18,39 @@ import Test.Tasty.HUnit
 tests :: TestTree
 tests = testGroup "deferred responses" [
 
-    --TODO: DOes not compile
-    -- testCase "do not affect hover requests" $ runSession hlsCommand fullCaps "test/testdata" $ do
-    --   doc <- openDoc "FuncTest.hs" "haskell"
+    testCase "do not affect hover requests" $ runSession hlsCommand fullCaps "test/testdata" $ do
+      doc <- openDoc "FuncTest.hs" "haskell"
 
-    --   id1 <- sendRequest TextDocumentHover (TextDocumentPositionParams doc (Position 4 2) Nothing)
+      let expectHoverText hover =
+              liftIO $ length (hover ^? _Just . contents) > 0
+                       @? "Found some hover text"
 
-    --   skipMany anyNotification
-    --   hoverRsp <- message :: Session HoverResponse
-    --   liftIO $ hoverRsp ^? result . _Just . _Just . contents @?= Nothing
-    --   liftIO $ hoverRsp ^. LSP.id @?= responseId id1
+      getHover doc (Position 4 2) >>= expectHoverText
 
-    --   id2 <- sendRequest TextDocumentDocumentSymbol (DocumentSymbolParams doc Nothing)
-    --   symbolsRsp <- skipManyTill anyNotification message :: Session DocumentSymbolsResponse
-    --   liftIO $ symbolsRsp ^. LSP.id @?= responseId id2
+      _ <- getDocumentSymbols doc
 
-    --   id3 <- sendRequest TextDocumentHover (TextDocumentPositionParams doc (Position 4 2) Nothing)
-    --   hoverRsp2 <- skipManyTill anyNotification message :: Session HoverResponse
-    --   liftIO $ hoverRsp2 ^. LSP.id @?= responseId id3
+      getHover doc (Position 4 2) >>= expectHoverText
 
-    --   let contents2 = hoverRsp2 ^? result . _Just . _Just . contents
-    --   liftIO $ contents2 `shouldNotSatisfy` null
+        -- Now that we have cache the following request should be instant
+      locations <- getHighlights doc (Position 7 0)
+      liftIO $ locations @?= [
+                    DocumentHighlight
+                     { _range = Range
+                       { _start = Position {_line = 5, _character = 6}
+                       , _end   = Position {_line = 5, _character = 8}
+                       }
+                     , _kind  = Just HkRead
+                     }
+                    , DocumentHighlight
+                     { _range = Range
+                       { _start = Position {_line = 7, _character = 0}
+                       , _end   = Position {_line = 7, _character = 2}
+                       }
+                     , _kind  = Just HkWrite
+                     }
+                   ]
 
-    --   -- Now that we have cache the following request should be instant
-    --   let highlightParams = TextDocumentPositionParams doc (Position 7 0) Nothing
-    --   highlightRsp <- request TextDocumentDocumentHighlight highlightParams
-    --   let (Just (List locations)) = highlightRsp ^. result
-    --   liftIO $ locations @?= [ DocumentHighlight
-    --                  { _range = Range
-    --                    { _start = Position {_line = 7, _character = 0}
-    --                    , _end   = Position {_line = 7, _character = 2}
-    --                    }
-    --                  , _kind  = Just HkWrite
-    --                  }
-    --                , DocumentHighlight
-    --                  { _range = Range
-    --                    { _start = Position {_line = 7, _character = 0}
-    --                    , _end   = Position {_line = 7, _character = 2}
-    --                    }
-    --                  , _kind  = Just HkWrite
-    --                  }
-    --                , DocumentHighlight
-    --                  { _range = Range
-    --                    { _start = Position {_line = 5, _character = 6}
-    --                    , _end   = Position {_line = 5, _character = 8}
-    --                    }
-    --                  , _kind  = Just HkRead
-    --                  }
-    --                , DocumentHighlight
-    --                  { _range = Range
-    --                    { _start = Position {_line = 7, _character = 0}
-    --                    , _end   = Position {_line = 7, _character = 2}
-    --                    }
-    --                  , _kind  = Just HkWrite
-    --                  }
-    --                , DocumentHighlight
-    --                  { _range = Range
-    --                    { _start = Position {_line = 7, _character = 0}
-    --                    , _end   = Position {_line = 7, _character = 2}
-    --                    }
-    --                  , _kind  = Just HkWrite
-    --                  }
-    --                , DocumentHighlight
-    --                  { _range = Range
-    --                    { _start = Position {_line = 5, _character = 6}
-    --                    , _end   = Position {_line = 5, _character = 8}
-    --                    }
-    --                  , _kind  = Just HkRead
-    --                  }
-    --                ]
-
-     testCase "instantly respond to failed modules with no cache" $ runSession hlsCommand fullCaps "test/testdata" $ do
+    , testCase "instantly respond to failed modules with no cache" $ runSession hlsCommand fullCaps "test/testdata" $ do
         doc <- openDoc "FuncTestFail.hs" "haskell"
         defs <- getDefinitions doc (Position 1 11)
         liftIO $ defs @?= []
