@@ -38,6 +38,6 @@ flags:
     BuildExecutable: false
 
 nix:
-  packages: [icu libcxx zlib]
+  packages: [ icu libcxx zlib ]
 
 concurrent-tests: false
