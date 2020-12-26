@@ -3,7 +3,7 @@
 module Deferred(tests) where
 
 import Control.Monad.IO.Class
-import Control.Lens (_Just, (^?), _Right)
+import Control.Lens ((^?), (^.), _Just, _Right)
 import Data.Maybe (fromJust)
 import qualified Data.Set as Set
 import Language.Haskell.LSP.Test
@@ -55,13 +55,11 @@ tests = testGroup "deferred responses" [
         defs <- getDefinitions doc (Position 1 11)
         liftIO $ defs @?= []
 
-    -- TODO: the benefits of caching parsed modules is doubted.
-    -- TODO: add issue link
-    -- , testCase "respond to untypecheckable modules with parsed module cache" $
-    --   runSession hlsCommand fullCaps "test/testdata" $ do
-    --     doc <- openDoc "FuncTestFail.hs" "haskell"
-    --     (Left (sym:_)) <- getDocumentSymbols doc
-    --     liftIO $ sym ^. name @?= "main"
+    , testCase "respond to untypecheckable modules with parsed module cache" $
+      runSession hlsCommand fullCaps "test/testdata" $ do
+        doc <- openDoc "FuncTestError.hs" "haskell"
+        Left (sym:_) <- getDocumentSymbols doc
+        liftIO $ sym ^. name @?= "Main"
 
     -- TODO does not compile
     -- , testCase "returns hints as diagnostics" $ runSession hlsCommand fullCaps "test/testdata" $ do

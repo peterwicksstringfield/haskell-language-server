@@ -5,9 +5,7 @@ main = putStrLn "hello"
 foo :: Int
 foo = bb
 
-bb = 5
-
-bug -- no hlint returned because of this, despite redundant do below
+bb = "a"
 
 baz = do
   putStrLn "hello"
