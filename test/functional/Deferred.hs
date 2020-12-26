@@ -61,40 +61,8 @@ tests = testGroup "deferred responses" [
         Left (sym:_) <- getDocumentSymbols doc
         liftIO $ sym ^. name @?= "Main"
 
-    -- TODO does not compile
-    -- , testCase "returns hints as diagnostics" $ runSession hlsCommand fullCaps "test/testdata" $ do
-    --     _ <- openDoc "FuncTest.hs" "haskell"
-
-    --     cwd <- liftIO getCurrentDirectory
-    --     let testUri = filePathToUri $ cwd </> "test/testdata/FuncTest.hs"
-
-    --     diags <- skipManyTill loggingNotification publishDiagnosticsNotification
-    --     liftIO $ diags ^? params @?= (Just $ PublishDiagnosticsParams
-    --                 { _uri         = testUri
-    --                 , _diagnostics = List
-    --                     [ Diagnostic
-    --                         (Range (Position 9 6) (Position 10 18))
-    --                         (Just DsInfo)
-    --                         (Just (StringValue "Redundant do"))
-    --                         (Just "hlint")
-    --                         "Redundant do\nFound:\n  do putStrLn \"hello\"\nWhy not:\n  putStrLn \"hello\"\n"
-    --                         Nothing
-    --                     ]
-    --                 }
-    --             )
-        -- let args' = H.fromList [("pos", toJSON (Position 7 0)), ("file", toJSON testUri)]
-        --     args = List [Object args']
-        --
-        -- executeRsp <- request WorkspaceExecuteCommand (ExecuteCommandParams "hare:demote" (Just args) Nothing)
-        -- liftIO $ executeRsp ^. result @?= Just (Object H.empty)
-
-        -- editReq <- message :: Session ApplyWorkspaceEditRequest
-        -- let expectedTextEdits = List [TextEdit (Range (Position 6 0) (Position 7 6)) "  where\n    bb = 5"]
-        --     expectedTextDocEdits = List [TextDocumentEdit (VersionedTextDocumentIdentifier testUri (Just 0)) expectedTextEdits]
-        -- liftIO $ editReq ^. params . edit @?= WorkspaceEdit
-        --       Nothing
-        --       (Just expectedTextDocEdits)
     , multiServerTests
+
     , multiMainTests
     ]
 
