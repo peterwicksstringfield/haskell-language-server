@@ -13,7 +13,8 @@ import Test.Tasty.HUnit
 
 tests :: TestTree
 tests = testGroup "references" [
-    ignoreTestBecause "Broken" $ testCase "works with definitions" $ runSession hlsCommand fullCaps "test/testdata" $ do
+    ignoreTestBecause "no references handler" $
+    testCase "works with definitions" $ runSession hlsCommand fullCaps "test/testdata" $ do
         doc <- openDoc "References.hs" "haskell"
         let pos = Position 2 7 -- foo = bar <--
         refs <- getReferences doc pos True
@@ -25,11 +26,15 @@ tests = testGroup "references" [
             , mkRange 4 0 4 3
             , mkRange 2 6 2 9
             ] `isInfixOf` refs @? "Contains references"
-    -- TODO: Respect withDeclaration parameter
-    -- ignoreTestBecause "Broken" $ testCase "works without definitions" $ runSession hlsCommand fullCaps "test/testdata" $ do
-    --   doc <- openDoc "References.hs" "haskell"
-    --   let pos = Position 2 7 -- foo = bar <--
-    --   refs <- getReferences doc pos False
-    --   liftIO $ refs `shouldNotContain` [Location (doc ^. uri) (mkRange 4 0 4 3)]
+
+    , ignoreTestBecause "no references handler" $
+      testCase "works without definitions" $ runSession hlsCommand fullCaps "test/testdata" $ do
+          doc <- openDoc "References.hs" "haskell"
+          let pos = Position 2 7 -- foo = bar <--
+          -- This False means do not include the definition of bar as a
+          -- reference to bar.
+          refs <- getReferences doc pos False
+          liftIO $ not (Location (doc ^. uri) (mkRange 4 0 4 3) `elem` refs)
+              @? "Should not treat the definition as a reference when we ask to exclude definitions"
     ]
     where mkRange sl sc el ec = Range (Position sl sc) (Position el ec)
