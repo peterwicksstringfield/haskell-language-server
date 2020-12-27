@@ -6,25 +6,29 @@ module Progress (tests) where
 import Control.Applicative.Combinators
 import Control.Lens hiding ((.=))
 import Control.Monad.IO.Class
+import Data.Aeson (encode, decode, object, toJSON, Value, (.=))
+import Data.Default
+import Data.Maybe (fromJust)
+import Data.List (delete)
+import Data.Text (Text, pack)
+import Ide.Plugin.Config
 import Language.Haskell.LSP.Test
 import Language.Haskell.LSP.Types
 import qualified Language.Haskell.LSP.Types.Lens as L
 import Language.Haskell.LSP.Types.Capabilities
+import System.FilePath ((</>))
 import Test.Hls.Util
 import Test.Tasty
+import Test.Tasty.ExpectedFailure (ignoreTestBecause)
 import Test.Tasty.HUnit
-import Data.Text (Text)
-import Data.Aeson (encode, decode, object, Value, (.=))
-import Data.Maybe (fromJust)
-import Data.List (delete)
 
 tests :: TestTree
 tests = testGroup "window/workDoneProgress" [
     testCase "sends indefinite progress notifications" $
         runSession hlsCommand progressCaps "test/testdata" $ do
-            doc <- openDoc "hlint/ApplyRefact2.hs" "haskell"
-            expectProgressReports ["Setting up hlint (for hlint/ApplyRefact2.hs)", "Processing"]
-            sendNotification TextDocumentDidSave (DidSaveTextDocumentParams doc)
+            let path = "hlint" </> "ApplyRefact2.hs"
+            _ <- openDoc path "haskell"
+            expectProgressReports [pack ("Setting up hlint (for " ++ path ++ ")"), "Processing"]
     , testCase "eval plugin sends progress reports" $
           runSession hlsCommand progressCaps "test/testdata/eval" $ do
               doc <- openDoc "T1.hs" "haskell"
@@ -32,7 +36,7 @@ tests = testGroup "window/workDoneProgress" [
               [evalLens] <- getCodeLenses doc
               let cmd = evalLens ^?! L.command . _Just
               _ <- sendRequest WorkspaceExecuteCommand $ ExecuteCommandParams (cmd ^. L.command) (decode $ encode $ fromJust $ cmd ^. L.arguments) Nothing
-              expectProgressReports ["Eval"]
+              expectProgressReports ["Evaluating"]
     , testCase "ormolu plugin sends progress notifications" $ do
           runSession hlsCommand progressCaps "test/testdata" $ do
               sendNotification WorkspaceDidChangeConfiguration (DidChangeConfigurationParams (formatLspConfig "ormolu"))
@@ -47,6 +51,14 @@ tests = testGroup "window/workDoneProgress" [
               expectProgressReports ["Setting up testdata (for Format.hs)", "Processing"]
               _ <- sendRequest TextDocumentFormatting $ DocumentFormattingParams doc (FormattingOptions 2 True) Nothing
               expectProgressReports ["Formatting Format.hs"]
+    , ignoreTestBecause "no liquid Haskell support" $
+      testCase "liquid haskell plugin sends progress notifications" $ do
+          runSession hlsCommand progressCaps "test/testdata" $ do
+              doc <- openDoc "liquid/Evens.hs" "haskell"
+              let config = def { liquidOn  = True, hlintOn = False }
+              sendNotification WorkspaceDidChangeConfiguration (DidChangeConfigurationParams (toJSON config))
+              sendNotification TextDocumentDidSave (DidSaveTextDocumentParams doc)
+              expectProgressReports ["Running Liquid Haskell on Evens.hs"]
     ]
 
 formatLspConfig :: Value -> Value
