@@ -28,6 +28,7 @@ module Test.Hls.Util
     , waitForDiagnosticsFromSourceWithTimeout
     , withFileLogging
     , withCurrentDirectoryInTmp
+    , withCradle
   )
 where
 
@@ -56,7 +57,7 @@ import           System.IO.Temp
 import           System.IO.Unsafe
 import           Test.Hspec.Runner
 import           Test.Hspec.Core.Formatters hiding (Seconds)
-import           Test.Tasty (TestTree)
+import           Test.Tasty (withResource, TestTree)
 import           Test.Tasty.ExpectedFailure (ignoreTestBecause, expectFailBecause)
 import           Test.Tasty.HUnit (assertFailure)
 import           Text.Blaze.Renderer.String (renderMarkup)
@@ -91,7 +92,23 @@ withFileLogging logFile f = do
 
   f
 
--- ---------------------------------------------------------------------
+-- | We have a cradle called "test-hie.yaml". Copy it to "hie.yaml" and then run
+-- the tests. Delete the copy after running the tests. Calling this function
+-- twice, perhaps inside of two different test suites that access the same test
+-- data files, would be mistake. If the calls are executed concurrently the
+-- first to finish will delete the file for both of them.
+withCradle :: FilePath -> TestTree -> TestTree
+withCradle rootDir test =
+    let cradleLocation = rootDir </> "test-hie.yaml"
+        moveTo = rootDir </> "hie.yaml"
+        copyCradle = do
+            b <- doesFileExist cradleLocation
+            if b then
+                copyFile cradleLocation moveTo
+            else
+                error $ "There is no file at " ++ cradleLocation ++ " but we expected to find a cradle file here."
+        deleteCopy () = removeFile moveTo
+     in withResource copyCradle deleteCopy $ const test
 
 data GhcVersion
   = GHC810
