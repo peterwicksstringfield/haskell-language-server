@@ -14,6 +14,7 @@ module Ide.Plugin.Pragmas
 import           Control.Lens                    hiding (List)
 import           Data.Aeson
 import qualified Data.HashMap.Strict             as H
+import           Data.Maybe                      (catMaybes)
 import qualified Data.Text                       as T
 import           Development.IDE                 as D
 import qualified GHC.Generics                    as Generics
@@ -85,7 +86,7 @@ codeActionProvider _ state _plId docId _ (J.CodeActionContext (J.List diags) _mo
             disabled
               | Just dynFlags <- mDynflags
                 -- GHC does not export 'OnOff', so we have to view it as string
-              = [ e | Just e <- T.stripPrefix "Off " . T.pack . prettyPrint <$> extensions dynFlags]
+              = catMaybes $ T.stripPrefix "Off " . T.pack . prettyPrint <$> extensions dynFlags
               | otherwise
                 -- When the module failed to parse, we don't have access to its
                 -- dynFlags. In that case, simply don't disable any pragmas.

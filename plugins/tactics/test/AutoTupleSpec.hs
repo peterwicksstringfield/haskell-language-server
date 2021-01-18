@@ -48,10 +48,11 @@ spec = describe "auto for tuple" $ do
             (auto' $ n * 2) `shouldSatisfy` isRight
 
 
+{- HLINT ignore randomGroups "Redundant <$>"-}
+
 randomGroups :: [a] -> Gen [[a]]
 randomGroups [] = pure []
 randomGroups as = do
   n <- choose (1, length as)
   (:) <$> pure (take n as)
       <*> randomGroups (drop n as)
-

@@ -126,6 +126,8 @@ ignoreForGhcVersions vers reason
 logFilePath :: String
 logFilePath = "hls-" ++ show ghcVersion ++ ".log"
 
+{- HLINT ignore hlsCommand "Missing NOINLINE pragma" -}
+
 -- | The command to execute the version of hls for the current compiler.
 --
 -- Both @stack test@ and @cabal new-test@ setup the environment so @hls@ is

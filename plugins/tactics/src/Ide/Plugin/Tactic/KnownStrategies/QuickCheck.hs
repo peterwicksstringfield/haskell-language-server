@@ -101,12 +101,11 @@ doesTypeContain recursive_tc =
 mkArbitraryCall :: TyCon -> Integer -> Type -> HsExpr GhcPs
 mkArbitraryCall recursive_tc n ty =
   let arbitrary = mkFunc "arbitrary"
-   in case doesTypeContain recursive_tc ty of
-        True ->
+   in if doesTypeContain recursive_tc ty
+        then
           mkFunc "scale"
             @@ bool (mkFunc "flip" @@ mkFunc "div" @@ int n)
                     (mkFunc "subtract" @@ int 1)
                     (n == 1)
             @@ arbitrary
-        False -> arbitrary
-
+        else arbitrary

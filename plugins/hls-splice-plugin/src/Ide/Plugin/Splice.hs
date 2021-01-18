@@ -26,6 +26,7 @@ import Control.Arrow
 import qualified Control.Foldl as L
 import Control.Lens (ix, view, (%~), (<&>), (^.))
 import Control.Monad
+import Control.Monad.Extra (eitherM)
 import qualified Control.Monad.Fail as Fail
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Except
@@ -322,8 +323,8 @@ manualCalcEdit lsp ran ps hscEnv typechkd srcSpan _eStyle ExpandSpliceParams {..
                                 graftDeclsWithM (RealSrcSpan srcSpan) $ \case
                                     (L _spn (SpliceD _ (SpliceDecl _ (L _ spl) _))) -> do
                                         eExpr <-
-                                            either (fail . show) pure
-                                                =<< lift
+                                            eitherM (fail . show) pure
+                                                $ lift
                                                     ( lift $
                                                         gtry @_ @SomeException $
                                                             (fst <$> rnTopSpliceDecls spl)
@@ -335,8 +336,8 @@ manualCalcEdit lsp ran ps hscEnv typechkd srcSpan _eStyle ExpandSpliceParams {..
                                 graftWithM (RealSrcSpan srcSpan) $ \case
                                     (L _spn (matchSplice astP -> Just spl)) -> do
                                         eExpr <-
-                                            either (fail . show) pure
-                                                =<< lift
+                                            eitherM (fail . show) pure
+                                                $ lift
                                                     ( lift $
                                                         gtry @_ @SomeException $
                                                             (fst <$> expandSplice astP spl)

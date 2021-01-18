@@ -90,6 +90,8 @@ withNewGoal :: a -> Judgement' a -> Judgement' a
 withNewGoal t = field @"_jGoal" .~ t
 
 
+{- HLINT ignore introducing "Use zipFrom" -}
+
 ------------------------------------------------------------------------------
 -- | Helper function for implementing functions which introduce new hypotheses.
 introducing
@@ -133,9 +135,9 @@ hasPositionalAncestry
                    -- otherwise nothing
 hasPositionalAncestry ancestors jdg name
   | not $ null ancestors
-  = case any (== name) ancestors of
-      True  -> Just True
-      False ->
+  = if name `elem` ancestors
+      then Just True
+      else
         case M.lookup name $ jAncestryMap jdg of
           Just ancestry ->
             bool Nothing (Just False) $ any (flip S.member ancestry) ancestors
@@ -155,9 +157,7 @@ filterAncestry ancestry reason jdg =
     disallowing reason (M.keys $ M.filterWithKey go $ jHypothesis jdg) jdg
   where
     go name _
-      = not
-      . isJust
-      $ hasPositionalAncestry ancestry jdg name
+      = isNothing $ hasPositionalAncestry ancestry jdg name
 
 
 ------------------------------------------------------------------------------
@@ -218,6 +218,8 @@ filterSameTypeFromOtherPositions dcon pos jdg =
    in disallowing Shadowed (M.keys to_remove) jdg
 
 
+{- HLINT ignore getAncestry "Replace case with maybe" -}
+
 ------------------------------------------------------------------------------
 -- | Return the ancestry of a 'PatVal', or 'mempty' otherwise.
 getAncestry :: Judgement' a -> OccName -> Set OccName
@@ -229,7 +231,7 @@ getAncestry jdg name =
 
 jAncestryMap :: Judgement' a -> Map OccName (Set OccName)
 jAncestryMap jdg =
-  flip M.map (jPatHypothesis jdg) pv_ancestry
+  M.map pv_ancestry (jPatHypothesis jdg)
 
 
 ------------------------------------------------------------------------------
@@ -270,10 +272,10 @@ introducingPat scrutinee dc ns jdg
 -- them from 'jHypothesis', but not from 'jEntireHypothesis'.
 disallowing :: DisallowReason -> [OccName] -> Judgement' a -> Judgement' a
 disallowing reason (S.fromList -> ns) =
-  field @"_jHypothesis" %~ (M.mapWithKey $ \name hi ->
-    case S.member name ns of
-      True -> overProvenance (DisallowedPrv reason) hi
-      False -> hi
+  field @"_jHypothesis" %~ M.mapWithKey (\name hi ->
+    if name `S.member` ns
+      then overProvenance (DisallowedPrv reason) hi
+      else hi
                            )
 
 
@@ -377,4 +379,3 @@ isDisallowed _               = False
 expandDisallowed :: Provenance -> Provenance
 expandDisallowed (DisallowedPrv _ prv) = expandDisallowed prv
 expandDisallowed prv = prv
-

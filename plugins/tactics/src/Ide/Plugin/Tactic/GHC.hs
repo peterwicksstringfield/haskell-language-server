@@ -7,9 +7,9 @@ module Ide.Plugin.Tactic.GHC where
 
 import           Control.Monad.State
 import qualified Data.Map as M
-import           Data.Maybe (isJust)
+import           Data.Maybe (isJust, fromMaybe)
 import           Data.Traversable
-import qualified DataCon as DataCon
+import qualified DataCon
 import           Development.IDE.GHC.Compat
 import           Generics.SYB (mkT, everywhere)
 import           Ide.Plugin.Tactic.Types
@@ -81,11 +81,8 @@ freshTyvars t = do
             pure $ (tv, setTyVarUnique tv uniq)
   pure $
     everywhere
-      (mkT $ \tv ->
-        case M.lookup tv reps of
-          Just tv' -> tv'
-          Nothing -> tv
-      ) t
+      (mkT $ \tv -> fromMaybe tv $ M.lookup tv reps)
+      t
 
 
 ------------------------------------------------------------------------------

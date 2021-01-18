@@ -100,7 +100,7 @@ provider lf ideState typ contents fp fo = withIndefiniteProgress lf title Cancel
 
 convertDynFlags :: DynFlags -> IO [DynOption]
 convertDynFlags df =
-    let pp = if null p then [] else ["-pgmF=" <> p]
+    let pp = ["-pgmF=" <> p | not (null p)]
         p = D.sPgm_F $ D.settings df
         pm = map (("-fplugin=" <>) . moduleNameString) $ D.pluginModNames df
         ex = map showExtension $ S.toList $ D.extensionFlags df

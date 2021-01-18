@@ -102,8 +102,8 @@ expectProgressReports = expectProgressReports' []
                 EndM msg -> do
                     liftIO $ token msg `expectElem` tokens
                     expectProgressReports' (delete (token msg) tokens) expectedTitles
-    title msg = msg ^. L.params ^. L.value ^. L.title
-    token msg = msg ^. L.params ^. L.token
+    title msg = msg ^. L.params . L.value . L.title
+    token msg = msg ^. L.params . L.token
     create = CreateM <$> message
     begin = BeginM <$> message
     progress = ProgressM <$> message

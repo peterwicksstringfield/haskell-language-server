@@ -17,6 +17,7 @@ module Ide.Plugin.Eval.Util (
 ) where
 
 import Control.Monad (join)
+import Control.Monad.Extra (maybeM)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (
@@ -87,7 +88,7 @@ handleMaybe :: Monad m => e -> Maybe b -> ExceptT e m b
 handleMaybe msg = maybe (throwE msg) return
 
 handleMaybeM :: Monad m => e -> m (Maybe b) -> ExceptT e m b
-handleMaybeM msg act = maybe (throwE msg) return =<< lift act
+handleMaybeM msg act = maybeM (throwE msg) return $ lift act
 
 response :: Functor f => ExceptT String f c -> f (Either ResponseError c)
 response =
