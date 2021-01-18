@@ -42,6 +42,8 @@ type Loc = Located Line
 
 type Line = Int
 
+{- HLINT ignore locate "Use zipWithFrom" -}
+
 locate :: Loc [a] -> [Loc a]
 locate (Located l tst) = zipWith Located [l ..] tst
 

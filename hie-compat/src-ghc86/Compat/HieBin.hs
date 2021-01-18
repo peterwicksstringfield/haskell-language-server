@@ -327,6 +327,9 @@ putName (HieSymbolTable next ref) bh name = do
 
 -- ** Converting to and from `HieName`'s
 
+{- HLINT ignore toHieName "Avoid restricted function" -}
+
+-- | Panics if the name is of sort Internal or System.
 toHieName :: Name -> HieName
 toHieName name
   | isKnownKeyName name = KnownKeyName (nameUnique name)

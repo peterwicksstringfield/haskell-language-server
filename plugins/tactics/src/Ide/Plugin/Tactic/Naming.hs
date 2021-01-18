@@ -66,9 +66,9 @@ mkGoodName
     -> OccName
 mkGoodName in_scope t =
   let tn = mkTyName t
-   in mkVarOcc $ case elem (mkVarOcc tn) in_scope of
-        True -> tn ++ show (length in_scope)
-        False -> tn
+   in mkVarOcc $ if mkVarOcc tn `elem` in_scope
+        then tn ++ show (length in_scope)
+        else tn
 
 
 ------------------------------------------------------------------------------
@@ -90,4 +90,3 @@ mkManyGoodNames hy args =
 -- | Which names are in scope?
 getInScope :: Map OccName a -> [OccName]
 getInScope = M.keys
-

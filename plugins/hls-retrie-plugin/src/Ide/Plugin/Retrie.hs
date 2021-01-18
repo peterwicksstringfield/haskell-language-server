@@ -21,6 +21,7 @@ import           Control.Concurrent.Extra       (readVar)
 import           Control.Exception.Safe         (Exception (..), SomeException,
                                                  catch, throwIO, try)
 import           Control.Monad                  (forM, unless)
+import           Control.Monad.Extra            (maybeM)
 import           Control.Monad.IO.Class         (MonadIO (liftIO))
 import           Control.Monad.Trans.Class      (MonadTrans (lift))
 import           Control.Monad.Trans.Except     (ExceptT (..), runExceptT,
@@ -240,7 +241,6 @@ suggestBindRewrites originatingFile pos ms_mod (FunBind {fun_id = L l' rdrName})
               description = "Fold " <> pprNameText <> describeRestriction restrictToOriginatingFile
            in (description, CodeActionRefactorExtract, RunRetrieParams {..})
      in [unfoldRewrite False, unfoldRewrite True, foldRewrite False, foldRewrite True]
-  where
 suggestBindRewrites _ _ _ _ = []
 
 describeRestriction :: IsString p => Bool -> p
@@ -414,9 +414,7 @@ callRetrie state session rewrites origin restrictToOriginatingFile = do
     -- TODO add the imports to the resulting edits
     (_user, ast, change@(Change _replacements _imports)) <-
       lift $ runRetrie fixityEnv retrie cpp
-    case ast of
-      _ ->
-        return $ asTextEdits change
+    return $ asTextEdits change
 
   let (errors :: [CallRetrieError], replacements) = partitionEithers results
       editParams :: WorkspaceEdit
@@ -490,7 +488,7 @@ handleMaybe :: Monad m => e -> Maybe b -> ExceptT e m b
 handleMaybe msg = maybe (throwE msg) return
 
 handleMaybeM :: Monad m => e -> m (Maybe b) -> ExceptT e m b
-handleMaybeM msg act = maybe (throwE msg) return =<< lift act
+handleMaybeM msg act = maybeM (throwE msg) return $ lift act
 
 response :: ExceptT String IO a -> IO (Either ResponseError a)
 response =

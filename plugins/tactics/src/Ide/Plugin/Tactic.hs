@@ -26,6 +26,7 @@ import           Data.Functor ((<&>))
 import           Data.Generics.Aliases (mkQ)
 import           Data.Generics.Schemes (everything)
 import           Data.List
+import           Data.List.Extra (enumerate)
 import           Data.Map (Map)
 import qualified Data.Map as M
 import           Data.Maybe
@@ -72,7 +73,7 @@ descriptor plId = (defaultPluginDescriptor plId)
               (tcCommandId tc)
               (tacticDesc $ tcCommandName tc)
               (tacticCmd $ commandTactic tc))
-              [minBound .. maxBound]
+            (enumerate :: [TacticCommand])
     , pluginCodeActionProvider = Just codeActionProvider
     }
 
@@ -158,7 +159,7 @@ codeActionProvider _conf state plId (TextDocumentIdentifier uri) range _ctx
         (_, jdg, _, dflags) <- judgementForHole state nfp range
         actions <- lift $
           -- This foldMap is over the function monoid.
-          foldMap commandProvider [minBound .. maxBound]
+          foldMap commandProvider (enumerate :: [TacticCommand])
             dflags
             plId
             uri
@@ -192,9 +193,9 @@ provide tc name _ plId uri range _ = do
 -- predicate holds for the goal.
 requireExtension :: Extension -> TacticProvider -> TacticProvider
 requireExtension ext tp dflags plId uri range jdg =
-  case xopt ext dflags of
-    True  -> tp dflags plId uri range jdg
-    False -> pure []
+  if xopt ext dflags
+    then tp dflags plId uri range jdg
+    else pure []
 
 
 ------------------------------------------------------------------------------
@@ -202,9 +203,9 @@ requireExtension ext tp dflags plId uri range jdg =
 -- predicate holds for the goal.
 filterGoalType :: (Type -> Bool) -> TacticProvider -> TacticProvider
 filterGoalType p tp dflags plId uri range jdg =
-  case p $ unCType $ jGoal jdg of
-    True  -> tp dflags plId uri range jdg
-    False -> pure []
+  if p $ unCType $ jGoal jdg
+    then tp dflags plId uri range jdg
+    else pure []
 
 
 ------------------------------------------------------------------------------
@@ -218,9 +219,9 @@ filterBindingType p tp dflags plId uri range jdg =
   let hy = jHypothesis jdg
       g  = jGoal jdg
    in fmap join $ for (M.toList hy) $ \(occ, hi_type -> CType ty) ->
-        case p (unCType g) ty of
-          True  -> tp occ ty dflags plId uri range jdg
-          False -> pure []
+        if p (unCType g) ty
+          then tp occ ty dflags plId uri range jdg
+          else pure []
 
 
 data TacticParams = TacticParams
@@ -365,4 +366,3 @@ getRhsPosVals rss tcs
 -- TODO(sandy): Make this more robust
 isHole :: OccName -> Bool
 isHole = isPrefixOf "_" . occNameString
-

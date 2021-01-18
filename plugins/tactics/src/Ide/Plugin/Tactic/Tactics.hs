@@ -107,16 +107,16 @@ destructAuto name = requireConcreteHole $ tracing "destruct(auto)" $ do
     Nothing -> throwError $ NotInScope name
     Just hi ->
       let subtactic = rule $ destruct' (const subgoal) name
-      in case isPatternMatch $ hi_provenance hi of
-            True ->
+      in if isPatternMatch $ hi_provenance hi
+            then
               pruning subtactic $ \jdgs ->
                 let getHyTypes = S.fromList . fmap hi_type . M.elems . jHypothesis
                     new_hy = foldMap getHyTypes jdgs
                     old_hy = getHyTypes jdg
-                in case S.null $ new_hy S.\\ old_hy of
-                      True  -> Just $ UnhelpfulDestruct name
-                      False -> Nothing
-            False -> subtactic
+                in if S.null $ new_hy S.\\ old_hy
+                      then Just $ UnhelpfulDestruct name
+                      else Nothing
+            else subtactic
 
 
 ------------------------------------------------------------------------------
@@ -205,9 +205,9 @@ splitAuto = requireConcreteHole $ tracing "split(auto)" $ do
     Nothing -> throwError $ GoalMismatch "split" g
     Just (tc, _) -> do
       let dcs = tyConDataCons tc
-      case isSplitWhitelisted jdg of
-        True -> choice $ fmap splitDataCon dcs
-        False -> do
+      if isSplitWhitelisted jdg
+        then choice $ fmap splitDataCon dcs
+        else do
           choice $ flip fmap dcs $ \dc -> requireNewHoles $
             splitDataCon dc
 
@@ -219,9 +219,9 @@ requireNewHoles :: TacticsM () -> TacticsM ()
 requireNewHoles m = do
   jdg <- goal
   pruning m $ \jdgs ->
-    case null jdgs || any (/= jGoal jdg) (fmap jGoal jdgs) of
-      True  -> Nothing
-      False -> Just NoProgress
+    if null jdgs || any (/= jGoal jdg) (fmap jGoal jdgs)
+      then Nothing
+      else Just NoProgress
 
 
 ------------------------------------------------------------------------------
@@ -232,9 +232,9 @@ splitDataCon dc =
     let g = jGoal jdg
     case splitTyConApp_maybe $ unCType g of
       Just (tc, apps) -> do
-        case elem dc $ tyConDataCons tc of
-          True -> buildDataCon (unwhitelistingSplit jdg) dc apps
-          False -> throwError $ IncorrectDataCon dc
+        if dc `elem` tyConDataCons tc
+          then buildDataCon (unwhitelistingSplit jdg) dc apps
+          else throwError $ IncorrectDataCon dc
       Nothing -> throwError $ GoalMismatch "splitDataCon" g
 
 
@@ -284,4 +284,3 @@ overAlgebraicTerms =
 
 allNames :: Judgement -> [OccName]
 allNames = M.keys . jHypothesis
-

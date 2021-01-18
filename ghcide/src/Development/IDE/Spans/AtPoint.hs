@@ -56,7 +56,7 @@ documentHighlight hf rf pos = MaybeT $ pure (Just highlights)
     ns = concat $ pointCommand hf pos (rights . M.keys . nodeIdentifiers . nodeInfo)
     highlights = do
       n <- ns
-      ref <- maybe [] id (M.lookup (Right n) rf)
+      ref <- fromMaybe [] (M.lookup (Right n) rf)
       pure $ makeHighlight ref
     makeHighlight (sp,dets) =
       DocumentHighlight (realSrcSpanToRange sp) (Just $ highlightType $ identInfo dets)
@@ -199,5 +199,3 @@ pointCommand hf pos k =
    sp fs = mkRealSrcSpan (sloc fs) (sloc fs)
    line = _line pos
    cha = _character pos
-
-

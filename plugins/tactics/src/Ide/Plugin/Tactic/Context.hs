@@ -22,6 +22,9 @@ import           TcType (substTy, tcSplitSigmaTy)
 import           Unify (tcUnifyTy)
 
 
+{- HLINT ignore mkContext "Redundant fmap" -}
+{- HLINT ignore mkContext "Use <=<" -}
+
 mkContext :: [(OccName, CType)] -> TcGblEnv -> Context
 mkContext locals tcg = Context
   { ctxDefiningFuncs = locals
@@ -32,6 +35,9 @@ mkContext locals tcg = Context
                    $ tcg_binds tcg
   }
 
+
+
+{- HLINT ignore contextMethodHypothesis "Redundant fmap" -}
 
 ------------------------------------------------------------------------------
 -- | Find all of the class methods that exist from the givens in the context.
@@ -93,4 +99,3 @@ getCurrentDefinitions = asks $ ctxDefiningFuncs
 
 getModuleHypothesis :: MonadReader Context m => m [(OccName, CType)]
 getModuleHypothesis = asks ctxModuleFuncs
-

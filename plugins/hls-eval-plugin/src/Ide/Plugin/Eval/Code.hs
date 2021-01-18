@@ -80,6 +80,8 @@ asStmts (Example e _) = NE.toList e
 asStmts (Property t _) =
     ["prop11 = " ++ t, "(propEvaluation prop11 :: IO String)"]
 
+{- HLINT ignore evalExpr "Avoid restricted function" -}
+
 -- |Evaluate an expression (either a pure expression or an IO a)
 evalExpr :: GhcMonad m => [Char] -> m String
 evalExpr e = do

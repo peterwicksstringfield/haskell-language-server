@@ -74,7 +74,7 @@ Right [Section {sectionName = "", sectionTests = [], sectionLanguage = Plain, se
 -}
 sections :: Parser Tk [Section]
 sections =
-    catMaybes <$> many (const Nothing <$> some code <|> Just <$> section)
+    catMaybes <$> many (Nothing <$ some code <|> Just <$> section)
 
 section :: Parser Tk Section
 section = sectionBody >>= sectionEnd
@@ -84,7 +84,7 @@ sectionBody =
     ( \(unLoc -> BlockOpen{..}) ts ->
         Section (fromMaybe "" blockName) (catMaybes ts) blockLanguage blockFormat
     )
-        <$> open <*> many (Just <$> example <|> Just <$> property <|> const Nothing <$> doc)
+        <$> open <*> many (Just <$> example <|> Just <$> property <|> Nothing <$ doc)
 
 sectionEnd :: Section -> Parser Tk Section
 sectionEnd s

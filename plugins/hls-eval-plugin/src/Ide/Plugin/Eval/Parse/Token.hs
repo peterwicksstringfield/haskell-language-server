@@ -145,6 +145,8 @@ tokens = concatMap (\(l, vs) -> map (Located l) vs) . zip [0 ..] . reverse . snd
       Right (st', tokens') -> (st', tokens' : tokens)
       Left err -> error $ unwords ["Tokens.next failed to parse", ln, err]
 
+{- HLINT ignore tokens "Use zipFrom" -}
+
 -- | Parse a line of input
 aline :: State -> TParser
 aline InCode          = optionStart <|> multi <|> singleOpen <|> codeLine
