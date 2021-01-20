@@ -1,5 +1,4 @@
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE LambdaCase #-}
 
 module Ide.Plugin.Tactic.KnownStrategies.QuickCheck where
 
