@@ -15,6 +15,7 @@ module Ide.Plugin.Tactic.Debug
 
 import Control.DeepSeq
 import Control.Exception
+import Data.Either (fromRight)
 import Debug.Trace
 import DynFlags (unsafeGlobalDynFlags)
 import Outputable hiding ((<>))
@@ -41,7 +42,7 @@ unsafeRender' sdoc = unsafePerformIO $ do
   -- We might not have unsafeGlobalDynFlags (like during testing), in which
   -- case GHC panics. Instead of crashing, let's just fail to print.
   !res <- try @GHC_EXCEPTION $ evaluate $ deepseq z z
-  pure $ either (const "<unsafeRender'>") id res
+  pure $ fromRight "<unsafeRender'>" res
 {-# NOINLINE unsafeRender' #-}
 
 traceMX :: (Monad m, Show a) => String -> a -> m ()
@@ -52,4 +53,3 @@ traceX str a = trace (mappend ("!!!" <> str <> ": ") $ show a)
 
 traceIdX :: (Show a) => String -> a -> a
 traceIdX str a = trace (mappend ("!!!" <> str <> ": ") $ show a) a
-

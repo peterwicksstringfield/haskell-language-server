@@ -1,7 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
-{-# OPTIONS_GHC -fno-warn-unused-imports -Wno-orphans #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 -- |GHC API utilities
 module Ide.Plugin.Eval.GHC (
@@ -20,7 +20,7 @@ import Development.IDE.GHC.Compat
 import qualified EnumSet
 import GHC.LanguageExtensions.Type (Extension (..))
 import GhcMonad (modifySession)
-import GhcPlugins (DefUnitId (..), InstalledUnitId (..), fsLit, hsc_IC)
+import GhcPlugins (fsLit, hsc_IC)
 import HscTypes (InteractiveContext (ic_dflags))
 import Ide.Plugin.Eval.Util (asS, gStrictTry)
 import qualified Lexer

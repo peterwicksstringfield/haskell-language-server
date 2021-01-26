@@ -77,6 +77,10 @@ import           Ide.Plugin.Brittany       as Brittany
 
 -- ---------------------------------------------------------------------
 
+-- Spurious suggestion. Hlint wants to simply the expression that builds up the
+-- list of included plugins.
+{- HLINT ignore idePlugins "Evaluate" -}
+
 -- | The plugins configured for use in this instance of the language
 -- server.
 -- These can be freely added or removed to tailor the available

@@ -150,14 +150,14 @@ extractImports ModSummary{ms_mod} topLevelBinds (Unfold thing)
   , names <- listify p fun_matches
   =
     [ AddImport {..}
-    | name <- names,
-        Just ideclNameString <-
-        [moduleNameString . GHC.moduleName <$> nameModule_maybe name],
-        let ideclSource = False,
+    | let ideclSource = False,
+        name <- names,
         let r = nameRdrName name,
         let ideclQualifiedBool = isQual r,
         let ideclAsString = moduleNameString . fst <$> isQual_maybe r,
-        let ideclThing = Just (IEVar $ occNameString $ rdrNameOcc r)
+        let ideclThing = Just (IEVar $ occNameString $ rdrNameOcc r),
+        Just ideclNameString <-
+          [moduleNameString . GHC.moduleName <$> nameModule_maybe name]
     ]
     where
         p name = nameModule_maybe name /= Just ms_mod
@@ -182,9 +182,8 @@ provider _a state plId (TextDocumentIdentifier uri) range ca = response $ do
           ++ [ r
                | TyClGroup {group_tyclds} <- hs_tyclds,
                  L l g <- group_tyclds,
-                 r <- suggestTypeRewrites uri ms_mod g,
-                 pos `isInsideSrcSpan` l
-
+                 pos `isInsideSrcSpan` l,
+                 r <- suggestTypeRewrites uri ms_mod g
              ]
 
   commands <- lift $

@@ -1,5 +1,3 @@
-{-# OPTIONS_GHC -Wwarn #-}
-
 -- | GHC language options parser
 module Ide.Plugin.Eval.Parse.Option (
     langOptions,

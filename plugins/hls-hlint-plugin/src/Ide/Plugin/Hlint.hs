@@ -8,13 +8,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PackageImports    #-}
 {-# LANGUAGE TypeFamilies      #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
+
+-- PackageImports used inside CPP guards.
+{- HLINT ignore "Unused LANGUAGE pragma" -}
 
 module Ide.Plugin.Hlint
   (
     descriptor
   --, provider
   ) where
-import Refact.Apply
 import Control.Arrow ((&&&))
 import Control.DeepSeq
 import Control.Exception
@@ -43,7 +46,7 @@ import "ghc" GHC as RealGHC (DynFlags(..))
 import "ghc" HscTypes as RealGHC.HscTypes (hsc_dflags, ms_hspp_opts)
 import qualified "ghc" EnumSet as EnumSet
 import Language.Haskell.GhclibParserEx.GHC.Driver.Session as GhclibParserEx (readExtension)
-import System.Environment(setEnv, unsetEnv)
+import System.Environment.Blank (setEnv, unsetEnv)
 import System.FilePath (takeFileName)
 import System.IO (hPutStr, noNewlineTranslation, hSetNewlineMode, utf8, hSetEncoding, IOMode(WriteMode), withFile, hClose)
 import System.IO.Temp
@@ -65,9 +68,9 @@ import Language.Haskell.LSP.Core
 import Language.Haskell.LSP.Types
 import qualified Language.Haskell.LSP.Types      as LSP
 import qualified Language.Haskell.LSP.Types.Lens as LSP
-
-import Text.Regex.TDFA.Text()
 import GHC.Generics (Generic)
+import Text.Regex.TDFA.Text()
+import Refact.Apply
 
 -- ---------------------------------------------------------------------
 
@@ -391,7 +394,7 @@ applyHint ide nfp mhint =
     -- WARNING: this code is not thread safe, so if you try to apply several async refactorings
     -- it could fail. That case is not very likely so we assume the risk.
     let withRuntimeLibdir :: IO a -> IO a
-        withRuntimeLibdir = bracket_ (setEnv key $ topDir dflags) (unsetEnv key)
+        withRuntimeLibdir = bracket_ (setEnv key (topDir dflags) True) (unsetEnv key)
             where key = "GHC_EXACTPRINT_GHC_LIBDIR"
     res <-
         liftIO $ withSystemTempFile (takeFileName fp) $ \temp h -> do

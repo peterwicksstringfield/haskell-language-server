@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 set -eou pipefail
-curl -sSL https://raw.github.com/ndmitchell/hlint/master/misc/run.sh | sh -s ghcide/src ghcide/exe ghcide/bench shake-bench/src ghcide/test/exe --with-group=extra --hint=ghcide/.hlint.yaml
+curl -sSL https://raw.github.com/ndmitchell/hlint/master/misc/run.sh | sh -s exe/ ghcide/ hls-exactprint-utils/ hls-plugin-api/ shake-bench/ plugins/ src/ --with-group=extra --ignore-glob='**/testdata/**' --ignore-glob='**/test/data/**'

@@ -1,7 +1,6 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveGeneric #-}
-{-# OPTIONS_GHC -Wwarn #-}
 
 module Ide.Plugin.Eval.Types (
     locate,

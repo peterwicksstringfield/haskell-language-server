@@ -2,7 +2,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
-{-# OPTIONS_GHC -Wall -Wwarn -fno-warn-type-defaults -fno-warn-unused-binds -fno-warn-unused-imports #-}
+{-# OPTIONS_GHC -Wall -Wwarn -fno-warn-type-defaults #-}
 
 {- | Keep the module name in sync with its file path.
 
@@ -52,7 +52,7 @@ import GHC (
     GenLocated (L),
     HsModule (hsmodName),
     ParsedModule (pm_parsed_source),
-    SrcSpan (RealSrcSpan),
+    SrcSpan (RealSrcSpan, UnhelpfulSpan),
     getSessionDynFlags,
     unLoc,
  )
@@ -143,31 +143,31 @@ asTextEdits Replace{..} = [TextEdit aRange aCode]
 -- | Required action (that can be converted to either CodeLenses or CodeActions)
 action :: LspFuncs c -> IdeState -> Uri -> IO (Maybe Action)
 action lsp state uri =
-    traceAs "action" <$> do
-        let Just nfp = uriToNormalizedFilePath $ toNormalizedUri uri
-        let Just fp = uriToFilePath' uri
+    traceAs "action" <$>
+        case (uriToNormalizedFilePath $ toNormalizedUri uri, uriToFilePath' uri) of
+            (Just nfp, Just fp) -> do
+                contents <- liftIO $ getVirtualFileFunc lsp $ toNormalizedUri uri
+                let emptyModule = maybe True (T.null . T.strip . virtualFileText) contents
 
-        contents <- liftIO $ getVirtualFileFunc lsp $ toNormalizedUri uri
-        let emptyModule = maybe True (T.null . T.strip . virtualFileText) contents
+                correctNameMaybe <- traceAs "correctName" <$> pathModuleName state nfp fp
+                statedNameMaybe <- traceAs "statedName" <$> codeModuleName state nfp
 
-        correctNameMaybe <- traceAs "correctName" <$> pathModuleName state nfp fp
-        statedNameMaybe <- traceAs "statedName" <$> codeModuleName state nfp
-
-        let act = Replace uri
-        let todo = case (correctNameMaybe, statedNameMaybe) of
-                (Just correctName, Just (nameRange, statedName))
-                    | correctName /= statedName ->
-                        Just $
-                            act
-                                nameRange
-                                ("Set module name to " <> correctName)
-                                correctName
-                (Just correctName, _)
-                    | emptyModule ->
-                        let code = T.unwords ["module", correctName, "where\n"]
-                         in Just $ act (Range (Position 0 0) (Position 0 0)) code code
-                _ -> Nothing
-        return todo
+                let act = Replace uri
+                let todo = case (correctNameMaybe, statedNameMaybe) of
+                        (Just correctName, Just (nameRange, statedName))
+                            | correctName /= statedName ->
+                                Just $
+                                    act
+                                        nameRange
+                                        ("Set module name to " <> correctName)
+                                        correctName
+                        (Just correctName, _)
+                            | emptyModule ->
+                                let code = T.unwords ["module", correctName, "where\n"]
+                                 in Just $ act (Range (Position 0 0) (Position 0 0)) code code
+                        _ -> Nothing
+                return todo
+            (_, _) -> return Nothing
 
 -- | The module name, as derived by the position of the module in its source directory
 pathModuleName :: IdeState -> NormalizedFilePath -> String -> IO (Maybe Text)
@@ -193,7 +193,10 @@ pathModuleName state normFilePath filePath
 -- | The module name, as stated in the module
 codeModuleName :: IdeState -> NormalizedFilePath -> IO (Maybe (Range, Text))
 codeModuleName state nfp =
-    ((\(L (RealSrcSpan l) m) -> (realSrcSpanToRange l, T.pack . show $ m)) <$>)
+    ((\(L l m) -> (case l of
+                     RealSrcSpan l' -> realSrcSpanToRange l'
+                     UnhelpfulSpan _ -> error "impossible",
+                   T.pack . show $ m)) <$>)
         . ((hsmodName . unLoc . pm_parsed_source) =<<)
         <$> runAction "ModuleName.GetParsedModule" state (use GetParsedModule nfp)
 

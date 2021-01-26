@@ -18,7 +18,7 @@ import           Ide.PluginUtils
 import           Ide.Types
 
 import           System.FilePath
-import           System.Environment (setEnv, unsetEnv)
+import           System.Environment.Blank (setEnv, unsetEnv)
 
 descriptor :: PluginId -> PluginDescriptor IdeState
 descriptor plId = (defaultPluginDescriptor plId)
@@ -38,7 +38,7 @@ provider _lf ide typ contents nfp opts = do
         FormatRange r -> (normalize r, extractRange r contents)
   (modsum, _) <- runAction "brittany" ide $ use_ GetModSummary nfp
   let dflags = ms_hspp_opts modsum
-  let withRuntimeLibdir = bracket_ (setEnv key $ topDir dflags) (unsetEnv key)
+  let withRuntimeLibdir = bracket_ (setEnv key (topDir dflags) True) (unsetEnv key)
         where key = "GHC_EXACTPRINT_GHC_LIBDIR"
   res <- withRuntimeLibdir $ formatText confFile opts selectedContents
   case res of

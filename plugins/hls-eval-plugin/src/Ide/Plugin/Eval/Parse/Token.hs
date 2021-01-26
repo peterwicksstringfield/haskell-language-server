@@ -1,5 +1,3 @@
-{-# OPTIONS_GHC -Wwarn #-}
-
 -- | Parse source code into a list of line Tokens.
 module Ide.Plugin.Eval.Parse.Token (
     Token(..),

@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# OPTIONS_GHC -Wwarn -fno-warn-orphans #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 
 -- | Expression execution
 module Ide.Plugin.Eval.Code (Statement, testRanges, resultRange, evalExtensions, evalSetup, evalExpr, propSetup, testCheck, asStatements) where

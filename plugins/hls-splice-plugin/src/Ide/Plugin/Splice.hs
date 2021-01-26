@@ -47,12 +47,11 @@ import Ide.Plugin.Splice.Types
 import Ide.PluginUtils (mkLspCommand, responseError)
 import Development.IDE.GHC.ExactPrint
 import Ide.Types
-import Language.Haskell.GHC.ExactPrint (TransformT, setPrecedingLines, uniqueSrcSpanT)
+import Language.Haskell.GHC.ExactPrint (setPrecedingLines, uniqueSrcSpanT)
 import Language.Haskell.LSP.Core
 import Language.Haskell.LSP.Messages
 import Language.Haskell.LSP.Types
 import qualified Language.Haskell.LSP.Types.Lens as J
-import Retrie.ExactPrint (Annotated)
 import RnSplice
 import TcRnMonad
 import Data.Foldable (Foldable(foldl'))
