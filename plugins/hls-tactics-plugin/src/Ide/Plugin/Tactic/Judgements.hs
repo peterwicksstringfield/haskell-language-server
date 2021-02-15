@@ -273,7 +273,7 @@ introducingPat scrutinee dc ns jdg
 disallowing :: DisallowReason -> [OccName] -> Judgement' a -> Judgement' a
 disallowing reason (S.fromList -> ns) =
   field @"_jHypothesis" %~ (\z -> Hypothesis . flip fmap (unHypothesis z) $ \hi ->
-    if $ hi_name hi `S.member` ns
+    if hi_name hi `S.member` ns
       then overProvenance (DisallowedPrv reason) hi
       else hi
                            )

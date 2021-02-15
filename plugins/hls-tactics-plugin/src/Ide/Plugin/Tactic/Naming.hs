@@ -71,9 +71,9 @@ mkGoodName
     -> OccName
 mkGoodName in_scope t =
   let tn = mkTyName t
-   in if $ mkVarOcc $ case S.member (mkVarOcc tn) in_scope
-        then tn ++ show (length in_scope)
-        else tn
+   in mkVarOcc $ if S.member (mkVarOcc tn) in_scope
+                 then tn ++ show (length in_scope)
+                 else tn
 
 
 ------------------------------------------------------------------------------

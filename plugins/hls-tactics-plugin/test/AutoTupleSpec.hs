@@ -3,7 +3,6 @@
 module AutoTupleSpec where
 
 import           Data.Either (isRight)
-import qualified Data.Map as M
 import           Ide.Plugin.Tactic.Debug
 import           Ide.Plugin.Tactic.Judgements (mkFirstJudgement)
 import           Ide.Plugin.Tactic.Machinery
@@ -48,11 +47,8 @@ spec = describe "auto for tuple" $ do
             (auto' $ n * 2) `shouldSatisfy` isRight
 
 
-{- HLINT ignore randomGroups "Redundant <$>"-}
-
 randomGroups :: [a] -> Gen [[a]]
 randomGroups [] = pure []
 randomGroups as = do
   n <- choose (1, length as)
-  (:) <$> pure (take n as)
-      <*> randomGroups (drop n as)
+  (take n as:) <$> randomGroups (drop n as)

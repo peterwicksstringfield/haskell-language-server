@@ -41,8 +41,7 @@ pattern Lambda pats body <-
 -- | Simlify an expression.
 simplify :: LHsExpr GhcPs -> LHsExpr GhcPs
 simplify
-  = head
-  . drop 3   -- Do three passes; this should be good enough for the limited
+  = (!! 3)   -- Do three passes; this should be good enough for the limited
              -- amount of gas we give to auto
   . iterate (everywhere $ foldEndo
     [ simplifyEtaReduce
@@ -78,7 +77,7 @@ simplifyEtaReduce = mkT $ \case
       (HsVar _ (L _ a)) | pat == a ->
     var "id"
   Lambda
-      (unsnoc -> Just (pats, (VarPat _ (L _ pat))))
+      (unsnoc -> Just (pats, VarPat _ (L _ pat)))
       (HsApp _ (L _ f) (L _ (HsVar _ (L _ a))))
       | pat == a
         -- We can only perform this simplifiation if @pat@ is otherwise unused.
@@ -93,8 +92,8 @@ simplifyEtaReduce = mkT $ \case
 simplifyCompose :: GenericT
 simplifyCompose = mkT $ \case
   Lambda
-      (unsnoc -> Just (pats, (VarPat _ (L _ pat))))
-      (unroll -> (fs@(_:_), (HsVar _ (L _ a))))
+      (unsnoc -> Just (pats, VarPat _ (L _ pat)))
+      (unroll -> (fs@(_:_), HsVar _ (L _ a)))
       | pat == a
         -- We can only perform this simplifiation if @pat@ is otherwise unused.
       , not (containsHsVar pat fs) ->
@@ -119,4 +118,3 @@ unroll (HsApp _ (L _ f) (L _ a)) =
   let (fs, r) = unroll a
    in (f : fs, r)
 unroll x = ([], x)
-

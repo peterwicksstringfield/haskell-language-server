@@ -120,7 +120,7 @@ setInitialDynFlags = do
         hPutStrLn stderr $ "Couldn't load cradle for libdir: " ++ show (err,dir,hieYaml,cradle)
         pure Nothing
       CradleNone -> do
-        hPutStrLn stderr $ "Couldn't load cradle (CradleNone)"
+        hPutStrLn stderr "Couldn't load cradle (CradleNone)"
         pure Nothing
   dynFlags <- mapM dynFlagsForPrinting libdir
   mapM_ setUnsafeGlobalDynFlags dynFlags

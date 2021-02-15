@@ -235,7 +235,7 @@ filterBindingType p tp dflags plId uri range jdg =
       g  = jGoal jdg
    in fmap join $ for (unHypothesis hy) $ \hi ->
         let ty = unCType $ hi_type hi
-         in if $ p (unCType g) ty
+         in if p (unCType g) ty
               then tp (hi_name hi) ty dflags plId uri range jdg
               else pure []
 

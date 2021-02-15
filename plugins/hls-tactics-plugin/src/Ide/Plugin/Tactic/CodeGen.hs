@@ -1,7 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TupleSections    #-}
 {-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE ViewPatterns     #-}
 
 module Ide.Plugin.Tactic.CodeGen
   ( module Ide.Plugin.Tactic.CodeGen
@@ -202,4 +201,3 @@ buildDataCon jdg dc tyapps = do
   pure
     . (rose (show dc) $ pure tr,)
     $ mkCon dc sgs
-

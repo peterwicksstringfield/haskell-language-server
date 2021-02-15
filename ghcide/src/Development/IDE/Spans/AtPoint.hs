@@ -266,12 +266,12 @@ typeLocationsAtPoint hiedb lookupModule _ideOptions pos (HAR _ ast _ _ hieKind) 
             HQualTy a b -> getTypes [a,b]
             HCastTy a -> getTypes [a]
             _ -> []
-        in fmap nubOrd $ concatMapM (fmap (maybe [] id) . nameToLocation hiedb lookupModule) (getTypes ts)
+        in fmap nubOrd $ concatMapM (fmap (fromMaybe []) . nameToLocation hiedb lookupModule) (getTypes ts)
     HieFresh ->
       let ts = concat $ pointCommand ast pos getts
           getts x = nodeType ni  ++ (mapMaybe identType $ M.elems $ nodeIdentifiers ni)
             where ni = nodeInfo x
-        in fmap nubOrd $ concatMapM (fmap (maybe [] id) . nameToLocation hiedb lookupModule) (getTypes ts)
+        in fmap nubOrd $ concatMapM (fmap (fromMaybe []) . nameToLocation hiedb lookupModule) (getTypes ts)
 
 namesInType :: Type -> [Name]
 namesInType (TyVarTy n)      = [Var.varName n]
