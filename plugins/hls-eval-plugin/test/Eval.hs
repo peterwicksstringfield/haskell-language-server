@@ -1,55 +1,45 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DuplicateRecordFields #-}
 
 module Eval (
     tests,
 ) where
 
 import Control.Applicative.Combinators (
-    skipManyTill,
+    skipManyTill
  )
 import Control.Monad (when)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
-import Language.Haskell.LSP.Test (
-    Session,
-    anyMessage,
-    documentContents,
-    executeCommand,
-    fullCaps,
-    getCodeLenses,
-    message,
-    openDoc,
-    runSession,
- )
-import Language.Haskell.LSP.Types (
-    ApplyWorkspaceEditRequest,
-    CodeLens (CodeLens, _command, _range),
-    Command (Command, _title),
-    Position (..),
-    Range (..),
-    TextDocumentIdentifier,
- )
+import Language.LSP.Test
+import Language.LSP.Types
+import Language.LSP.Types.Lens (command, title, range)
+import Control.Lens (view, _Just, preview)
 import System.Directory (doesFileExist)
 import System.FilePath (
     (<.>),
     (</>),
  )
-import Test.Hls.Util (hlsCommand)
+import Test.Hls.Util (hlsCommand, GhcVersion (GHC84, GHC86), knownBrokenForGhcVersions, knownBrokenInEnv, EnvSpec (HostOS, GhcVer), OS (Windows))
 import Test.Tasty (
     TestTree,
     testGroup,
  )
 import Test.Tasty.ExpectedFailure (
     expectFailBecause,
-    ignoreTestBecause,
  )
 import Test.Tasty.HUnit (
     testCase,
     (@?=),
  )
+import Data.List.Extra (nubOrdOn)
+import Ide.Plugin.Eval.Types (EvalParams(..))
+import Data.Aeson (fromJSON)
+import Data.Aeson.Types (Result(Success))
 
 tests :: TestTree
 tests =
@@ -59,27 +49,27 @@ tests =
             runSession hlsCommand fullCaps evalPath $ do
                 doc <- openDoc "T1.hs" "haskell"
                 lenses <- getEvalCodeLenses doc
-                liftIO $ map (fmap _title . _command) lenses @?= [Just "Evaluate..."]
+                liftIO $ map (preview $ command . _Just . title) lenses @?= [Just "Evaluate..."]
         , testCase "Produces Refresh code lenses" $
             runSession hlsCommand fullCaps evalPath $ do
                 doc <- openDoc "T2.hs" "haskell"
                 lenses <- getEvalCodeLenses doc
-                liftIO $ map (fmap _title . _command) lenses @?= [Just "Refresh..."]
+                liftIO $ map (preview $ command . _Just . title) lenses @?= [Just "Refresh..."]
         , testCase "Code lenses have ranges" $
             runSession hlsCommand fullCaps evalPath $ do
                 doc <- openDoc "T1.hs" "haskell"
                 lenses <- getEvalCodeLenses doc
-                liftIO $ map _range lenses @?= [Range (Position 4 0) (Position 5 0)]
+                liftIO $ map (view range) lenses @?= [Range (Position 4 0) (Position 5 0)]
         , testCase "Multi-line expressions have a multi-line range" $ do
             runSession hlsCommand fullCaps evalPath $ do
                 doc <- openDoc "T3.hs" "haskell"
                 lenses <- getEvalCodeLenses doc
-                liftIO $ map _range lenses @?= [Range (Position 3 0) (Position 5 0)]
+                liftIO $ map (view range) lenses @?= [Range (Position 3 0) (Position 5 0)]
         , testCase "Executed expressions range covers only the expression" $ do
             runSession hlsCommand fullCaps evalPath $ do
                 doc <- openDoc "T2.hs" "haskell"
                 lenses <- getEvalCodeLenses doc
-                liftIO $ map _range lenses @?= [Range (Position 4 0) (Position 5 0)]
+                liftIO $ map (view range) lenses @?= [Range (Position 4 0) (Position 5 0)]
         , testCase "Evaluation of expressions" $ goldenTest "T1.hs"
         , testCase "Reevaluation of expressions" $ goldenTest "T2.hs"
         , testCase "Evaluation of expressions w/ imports" $ goldenTest "T3.hs"
@@ -128,6 +118,9 @@ tests =
             "Multi line comments"
             $ goldenTest "TMulti.hs"
         , testCase
+            "Multi line comments, with the last test line ends without newline"
+            $ goldenTest "TEndingMulti.hs"
+        , testCase
             "Evaluate expressions in Plain comments in both single line and multi line format"
             $ goldenTest "TPlainComment.hs"
         , testCase
@@ -138,27 +131,39 @@ tests =
         , testCase "Local Modules imports are accessible in a test" $
             goldenTest "TLocalImport.hs"
         , -- , testCase "Local Modules can be imported in a test" $ goldenTest "TLocalImportInTest.hs"
-          ignoreTestBecause "Unexplained but minor issue" $
+          expectFailBecause "Unexplained but minor issue" $
             testCase "Setting language option TupleSections" $
                 goldenTest "TLanguageOptionsTupleSections.hs"
+        , testCase ":set accepts ghci flags" $
+            goldenTest "TFlags.hs"
         , testCase "IO expressions are supported, stdout/stderr output is ignored" $
             goldenTest "TIO.hs"
         , testCase "Property checking" $ goldenTest "TProperty.hs"
         , testCase
             "Prelude has no special treatment, it is imported as stated in the module"
             $ goldenTest "TPrelude.hs"
+        , testCase
+            "Don't panic on {-# UNPACK #-} pragma"
+            $ goldenTest "TUNPACK.hs"
+        , testCase
+            "Can handle eval inside nested comment properly"
+            $ goldenTest "TNested.hs"
         , testCase "Test on last line insert results correctly" $ do
             runSession hlsCommand fullCaps evalPath $
                 liftIO $ do
                     let mdl = "TLastLine.hs"
                     -- Write the test file, to make sure that it has no final line return
-                    writeFile (evalPath </> mdl) $ "module TLastLine where\n\n-- >>> take 3 [1..]"
+                    writeFile (evalPath </> mdl) "module TLastLine where\n\n-- >>> take 3 [1..]"
                     goldenTest mdl
-#if __GLASGOW_HASKELL__ >= 808
-            , testCase "CPP support" $ goldenTest "TCPP.hs"
-            , testCase "Literate Haskell Bird Style" $ goldenTest "TLHS.lhs"
-#endif
+            , testGroup "with preprocessors"
+            [ knownBrokenInEnv [HostOS Windows, GhcVer GHC84, GhcVer GHC86]
+                "CPP eval on Windows and/or GHC <= 8.6 fails for some reasons" $
+              testCase "CPP support" $ goldenTest "TCPP.hs"
+            , knownBrokenForGhcVersions [GHC84, GHC86]
+                "Preprocessor known to fail on GHC <= 8.6"
+                $ testCase "Literate Haskell Bird Style" $ goldenTest "TLHS.lhs"
             -- , testCase "Literate Haskell LaTeX Style" $ goldenTest "TLHSLateX.lhs"
+            ]
         ]
 
 goldenTest :: FilePath -> IO ()
@@ -175,8 +180,11 @@ goldenTestBy fltr input = runSession hlsCommand fullCaps evalPath $ do
     codeLenses <- reverse <$> getCodeLensesBy fltr doc
     -- liftIO $ print codeLenses
 
-    -- Execute sequentially
-    mapM_ executeCmd $ [c | CodeLens{_command = Just c} <- codeLenses]
+    -- Execute sequentially, nubbing elements to avoid
+    -- evaluating the same section with multiple tests
+    -- more than twice
+    mapM_ executeCmd
+        $ nubOrdOn actSectionId [c | CodeLens{_command = Just c} <- codeLenses]
 
     edited <- replaceUnicodeQuotes <$> documentContents doc
     -- liftIO $ T.putStrLn edited
@@ -190,6 +198,10 @@ goldenTestBy fltr input = runSession hlsCommand fullCaps evalPath $ do
         expected <- T.readFile expectedFile
         edited @?= expected
 
+actSectionId :: Command -> Int
+actSectionId Command{_arguments = Just (List [fromJSON -> Success EvalParams{..}])} = evalId
+actSectionId _ = error "Invalid CodeLens"
+
 getEvalCodeLenses :: TextDocumentIdentifier -> Session [CodeLens]
 getEvalCodeLenses = getCodeLensesBy isEvalTest
 
@@ -200,7 +212,7 @@ getCodeLensesBy f doc = filter f <$> getCodeLenses doc
 executeCmd :: Command -> Session ()
 executeCmd cmd = do
     executeCommand cmd
-    _resp :: ApplyWorkspaceEditRequest <- skipManyTill anyMessage message
+    _resp <- skipManyTill anyMessage (message SWorkspaceApplyEdit)
     -- liftIO $ print _resp
     return ()
 

@@ -1,27 +1,34 @@
-{-# LANGUAGE CPP, OverloadedStrings, NamedFieldPuns, MultiParamTypeClasses #-}
+{-# LANGUAGE CPP, OverloadedStrings, NamedFieldPuns, MultiParamTypeClasses, DuplicateRecordFields, TypeOperators, GADTs #-}
+{-# LANGUAGE FlexibleContexts #-}
 module Test.Hls.Util
   (
       codeActionSupportCaps
-    , dummyLspFuncs
     , expectCodeAction
     , expectDiagnostic
     , expectNoMoreDiagnostics
+    , expectSameLocations
     , failIfSessionTimeout
     , flushStackEnvironment
     , fromAction
     , fromCommand
     , getHspecFormattedConfig
     , ghcVersion, GhcVersion(..)
+    , hostOS, OS(..)
+    , matchesCurrentEnv, EnvSpec(..)
     , hlsCommand
     , hlsCommandExamplePlugin
     , hlsCommandVomit
     , ignoreForGhcVersions
+    , ignoreInEnv
     , inspectCodeAction
     , inspectCommand
     , inspectDiagnostic
+    , knownBrokenOnWindows
     , knownBrokenForGhcVersions
+    , knownBrokenInEnv
     , logFilePath
     , setupBuildToolFiles
+    , SymbolLocation
     , waitForDiagnosticsFrom
     , waitForDiagnosticsFromSource
     , waitForDiagnosticsFromSourceWithTimeout
@@ -29,6 +36,7 @@ module Test.Hls.Util
   )
 where
 
+import qualified Data.Aeson as A
 import           Control.Exception (throwIO, catch)
 import           Control.Monad
 import           Control.Monad.IO.Class
@@ -38,13 +46,12 @@ import           Data.Default
 import           Data.List (intercalate)
 import           Data.List.Extra (find)
 import           Data.Maybe
+import qualified Data.Set as Set
 import qualified Data.Text as T
-import           Language.Haskell.LSP.Core
-import           Language.Haskell.LSP.Messages (FromServerMessage(NotLogMessage))
-import           Language.Haskell.LSP.Types
-import qualified Language.Haskell.LSP.Test as Test
-import qualified Language.Haskell.LSP.Types.Lens as L
-import qualified Language.Haskell.LSP.Types.Capabilities as C
+import           Language.LSP.Types hiding (Reason(..))
+import qualified Language.LSP.Test as Test
+import qualified Language.LSP.Types.Lens as L
+import qualified Language.LSP.Types.Capabilities as C
 import           System.Directory
 import           System.Environment
 import           System.Time.Extra (Seconds, sleep)
@@ -55,16 +62,17 @@ import           Test.Hspec.Runner
 import           Test.Hspec.Core.Formatters hiding (Seconds)
 import           Test.Tasty (TestTree)
 import           Test.Tasty.ExpectedFailure (ignoreTestBecause, expectFailBecause)
-import           Test.Tasty.HUnit (assertFailure)
+import           Test.Tasty.HUnit (Assertion, assertFailure, (@?=))
 import           Text.Blaze.Renderer.String (renderMarkup)
 import           Text.Blaze.Internal hiding (null)
+import System.Info.Extra (isWindows, isMac)
 
 codeActionSupportCaps :: C.ClientCapabilities
 codeActionSupportCaps = def { C._textDocument = Just textDocumentCaps }
   where
     textDocumentCaps = def { C._codeAction = Just codeActionCaps }
-    codeActionCaps = C.CodeActionClientCapabilities (Just True) (Just literalSupport)
-    literalSupport = C.CodeActionLiteralSupport def
+    codeActionCaps = CodeActionClientCapabilities (Just True) (Just literalSupport) (Just True)
+    literalSupport = CodeActionLiteralSupport def
 
 -- ---------------------------------------------------------------------
 
@@ -113,9 +121,42 @@ ghcVersion = GHC86
 ghcVersion = GHC84
 #endif
 
+data EnvSpec = HostOS OS | GhcVer GhcVersion
+    deriving (Show, Eq)
+
+matchesCurrentEnv :: EnvSpec -> Bool
+matchesCurrentEnv (HostOS os) = hostOS == os
+matchesCurrentEnv (GhcVer ver) = ghcVersion == ver
+
+data OS = Windows | MacOS | Linux
+    deriving (Show, Eq)
+
+hostOS :: OS
+hostOS
+    | isWindows = Windows
+    | isMac = MacOS
+    | otherwise = Linux
+
+-- | Mark as broken if /any/ of environmental spec mathces the current environment.
+knownBrokenInEnv :: [EnvSpec] -> String -> TestTree -> TestTree
+knownBrokenInEnv envSpecs reason
+    | any matchesCurrentEnv envSpecs = expectFailBecause reason
+    | otherwise = id
+
+knownBrokenOnWindows :: String -> TestTree -> TestTree
+knownBrokenOnWindows reason
+    | isWindows = expectFailBecause reason
+    | otherwise = id
+
 knownBrokenForGhcVersions :: [GhcVersion] -> String -> TestTree -> TestTree
 knownBrokenForGhcVersions vers reason
     | ghcVersion `elem` vers =  expectFailBecause reason
+    | otherwise = id
+
+-- | IgnroeTest if /any/ of environmental spec mathces the current environment.
+ignoreInEnv :: [EnvSpec] -> String -> TestTree -> TestTree
+ignoreInEnv envSpecs reason
+    | any matchesCurrentEnv envSpecs = ignoreTestBecause reason
     | otherwise = id
 
 ignoreForGhcVersions :: [GhcVersion] -> String -> TestTree -> TestTree
@@ -251,22 +292,6 @@ flushStackEnvironment = do
 
 -- ---------------------------------------------------------------------
 
-dummyLspFuncs :: Default a => LspFuncs a
-dummyLspFuncs = LspFuncs { clientCapabilities = def
-                         , config = return (Just def)
-                         , sendFunc = const (return ())
-                         , getVirtualFileFunc = const (return Nothing)
-                         , persistVirtualFileFunc = \uri -> return (uriToFilePath (fromNormalizedUri uri))
-                         , reverseFileMapFunc = return id
-                         , publishDiagnosticsFunc = mempty
-                         , flushDiagnosticsBySourceFunc = mempty
-                         , getNextReqId = pure (IdInt 0)
-                         , rootPath = Nothing
-                         , getWorkspaceFolders = return Nothing
-                         , withProgress = \_ _ f -> f (const (return ()))
-                         , withIndefiniteProgress = \_ _ f -> f
-                         }
-
 -- | Like 'withCurrentDirectory', but will copy the directory over to the system
 -- temporary directory first to avoid haskell-language-server's source tree from
 -- interfering with the cradle
@@ -294,12 +319,12 @@ copyDir src dst = do
         else copyFile srcFp dstFp
   where ignored = ["dist", "dist-newstyle", ".stack-work"]
 
-fromAction :: CAResult -> CodeAction
-fromAction (CACodeAction action) = action
+fromAction :: (Command |? CodeAction) -> CodeAction
+fromAction (InR action) = action
 fromAction _ = error "Not a code action"
 
-fromCommand :: CAResult -> Command
-fromCommand (CACommand command) = command
+fromCommand :: (Command |? CodeAction) -> Command
+fromCommand (InL command) = command
 fromCommand _ = error "Not a command"
 
 onMatch :: [a] -> (a -> Bool) -> String -> IO a
@@ -312,24 +337,24 @@ inspectDiagnostic diags s = onMatch diags (\ca -> all (`T.isInfixOf` (ca ^. L.me
 expectDiagnostic :: [Diagnostic] -> [T.Text] -> IO ()
 expectDiagnostic diags s = void $ inspectDiagnostic diags s
 
-inspectCodeAction :: [CAResult] -> [T.Text] -> IO CodeAction
+inspectCodeAction :: [Command |? CodeAction] -> [T.Text] -> IO CodeAction
 inspectCodeAction cars s = fromAction <$> onMatch cars predicate err
-    where predicate (CACodeAction ca) = all (`T.isInfixOf` (ca ^. L.title)) s
+    where predicate (InR ca) = all (`T.isInfixOf` (ca ^. L.title)) s
           predicate _ = False
           err = "expected code action matching '" ++ show s ++ "' but did not find one"
 
-expectCodeAction :: [CAResult] -> [T.Text] -> IO ()
+expectCodeAction :: [Command |? CodeAction] -> [T.Text] -> IO ()
 expectCodeAction cars s = void $ inspectCodeAction cars s
 
-inspectCommand :: [CAResult] -> [T.Text] -> IO Command
+inspectCommand :: [Command |? CodeAction] -> [T.Text] -> IO Command
 inspectCommand cars s = fromCommand <$> onMatch cars predicate err
-    where predicate (CACommand command) = all  (`T.isInfixOf` (command ^. L.title)) s
+    where predicate (InL command) = all  (`T.isInfixOf` (command ^. L.title)) s
           predicate _ = False
           err = "expected code action matching '" ++ show s ++ "' but did not find one"
 
 waitForDiagnosticsFrom :: TextDocumentIdentifier -> Test.Session [Diagnostic]
 waitForDiagnosticsFrom doc = do
-    diagsNot <- skipManyTill Test.anyMessage Test.message :: Test.Session PublishDiagnosticsNotification
+    diagsNot <- skipManyTill Test.anyMessage (Test.message STextDocumentPublishDiagnostics)
     let (List diags) = diagsNot ^. L.params . L.diagnostics
     if doc ^. L.uri /= diagsNot ^. L.params . L.uri
        then waitForDiagnosticsFrom doc
@@ -337,7 +362,7 @@ waitForDiagnosticsFrom doc = do
 
 waitForDiagnosticsFromSource :: TextDocumentIdentifier -> String -> Test.Session [Diagnostic]
 waitForDiagnosticsFromSource doc src = do
-    diagsNot <- skipManyTill Test.anyMessage Test.message :: Test.Session PublishDiagnosticsNotification
+    diagsNot <- skipManyTill Test.anyMessage (Test.message STextDocumentPublishDiagnostics)
     let (List diags) = diagsNot ^. L.params . L.diagnostics
     let res = filter matches diags
     if doc ^. L.uri /= diagsNot ^. L.params . L.uri || null res
@@ -367,7 +392,7 @@ waitForDiagnosticsFromSourceWithTimeout timeout document source = do
         -- Send a dummy message to provoke a response from the server.
         -- This guarantees that we have at least one message to
         -- process, so message won't block or timeout.
-        void $ Test.sendRequest (CustomClientMethod "non-existent-method") ()
+        void $ Test.sendNotification (SCustomMethod "non-existent-method") A.Null
     handleMessages
   where
     matches :: Diagnostic -> Bool
@@ -375,7 +400,7 @@ waitForDiagnosticsFromSourceWithTimeout timeout document source = do
 
     handleMessages = handleDiagnostic <|> handleCustomMethodResponse <|> ignoreOthers
     handleDiagnostic = do
-        diagsNot <- Test.message :: Test.Session PublishDiagnosticsNotification
+        diagsNot <- Test.message STextDocumentPublishDiagnostics
         let fileUri = diagsNot ^. L.params . L.uri
             (List diags) = diagsNot ^. L.params . L.diagnostics
             res = filter matches diags
@@ -386,8 +411,9 @@ waitForDiagnosticsFromSourceWithTimeout timeout document source = do
         -- handle that and then exit
         void (Test.satisfyMaybe responseForNonExistentMethod) >> return []
 
+    responseForNonExistentMethod :: FromServerMessage -> Maybe FromServerMessage
     responseForNonExistentMethod notif
-        | NotLogMessage logMsg <- notif,
+        | FromServerMess SWindowLogMessage logMsg <- notif,
           "non-existent-method" `T.isInfixOf` (logMsg ^. L.params . L.message)  = Just notif
         | otherwise = Nothing
 
@@ -398,3 +424,20 @@ failIfSessionTimeout action = action `catch` errorHandler
     where errorHandler :: Test.SessionException -> IO a
           errorHandler e@(Test.Timeout _) = assertFailure $ show e
           errorHandler e = throwIO e
+
+-- | To locate a symbol, we provide a path to the file from the HLS root
+-- directory, the line number, and the column number. (0 indexed.)
+type SymbolLocation = (FilePath, Int, Int)
+
+expectSameLocations :: [Location] -> [SymbolLocation] -> Assertion
+actual `expectSameLocations` expected = do
+    let actual' =
+            Set.map (\location -> (location ^. L.uri
+                                   , location ^. L.range . L.start . L.line
+                                   , location ^. L.range . L.start . L.character))
+            $ Set.fromList actual
+    expected' <- Set.fromList <$>
+        (forM expected $ \(file, l, c) -> do
+                              fp <- canonicalizePath file
+                              return (filePathToUri fp, l, c))
+    actual' @?= expected'

@@ -1,13 +1,19 @@
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE CPP #-}
+#include "ghc-api-version.h"
 
 {-|
 The logic for setting up a ghcide session by tapping into hie-bios.
 -}
 module Development.IDE.Session
   (SessionLoadingOptions(..)
+  ,CacheDirs(..)
   ,defaultLoadingOptions
   ,loadSession
   ,loadSessionWithOptions
+  ,setInitialDynFlags
+  ,getHieDbLoc
+  ,runWithDb
   ) where
 
 -- Unfortunately, we cannot use loadSession with ghc-lib since hie-bios uses
@@ -44,6 +50,7 @@ import Development.IDE.GHC.Util
 import Development.IDE.Session.VersionCheck
 import Development.IDE.Types.Diagnostics
 import Development.IDE.Types.Exports
+import Development.IDE.Types.HscEnvEq (HscEnvEq, newHscEnvEqPreserveImportPaths, newHscEnvEq)
 import Development.IDE.Types.Location
 import Development.IDE.Types.Logger
 import Development.IDE.Types.Options
@@ -53,9 +60,8 @@ import qualified HIE.Bios as HieBios
 import HIE.Bios.Environment hiding (getCacheDir)
 import HIE.Bios.Types
 import Hie.Implicit.Cradle (loadImplicitHieCradle)
-import Language.Haskell.LSP.Core
-import Language.Haskell.LSP.Messages
-import Language.Haskell.LSP.Types
+import Language.LSP.Server
+import Language.LSP.Types
 import System.Directory
 import qualified System.Directory.Extra as IO
 import System.FilePath
@@ -70,6 +76,16 @@ import NameCache
 import Packages
 import Control.Exception (evaluate)
 import Data.Void
+import Control.Applicative (Alternative((<|>)))
+
+import HieDb.Create
+import HieDb.Types
+import HieDb.Utils
+import Database.SQLite.Simple
+import Control.Concurrent.STM.TQueue
+import Control.Concurrent.STM (atomically)
+import Maybes (MaybeT(runMaybeT))
+import HIE.Bios.Cradle (yamlConfig)
 
 
 data CacheDirs = CacheDirs
@@ -90,6 +106,61 @@ defaultLoadingOptions = SessionLoadingOptions
     ,loadCradle = HieBios.loadCradle
     ,getCacheDirs = getCacheDirsDefault
     }
+
+-- | Sets `unsafeGlobalDynFlags` on using the hie-bios cradle and returns the GHC libdir
+setInitialDynFlags :: IO (Maybe LibDir)
+setInitialDynFlags = do
+  dir <- IO.getCurrentDirectory
+  hieYaml <- runMaybeT $ yamlConfig dir
+  cradle <- maybe (HieBios.loadImplicitCradle $ addTrailingPathSeparator dir) HieBios.loadCradle hieYaml
+  libDirRes <- getRuntimeGhcLibDir cradle
+  libdir <- case libDirRes of
+      CradleSuccess libdir -> pure $ Just $ LibDir libdir
+      CradleFail err -> do
+        hPutStrLn stderr $ "Couldn't load cradle for libdir: " ++ show (err,dir,hieYaml,cradle)
+        pure Nothing
+      CradleNone -> do
+        hPutStrLn stderr $ "Couldn't load cradle (CradleNone)"
+        pure Nothing
+  dynFlags <- mapM dynFlagsForPrinting libdir
+  mapM_ setUnsafeGlobalDynFlags dynFlags
+  pure libdir
+
+-- | Wraps `withHieDb` to provide a database connection for reading, and a `HieWriterChan` for
+-- writing. Actions are picked off one by one from the `HieWriterChan` and executed in serial
+-- by a worker thread using a dedicated database connection.
+-- This is done in order to serialize writes to the database, or else SQLite becomes unhappy
+runWithDb :: FilePath -> (HieDb -> IndexQueue -> IO ()) -> IO ()
+runWithDb fp k = do
+  -- Delete the database if it has an incompatible schema version
+  withHieDb fp (const $ pure ())
+    `catch` \IncompatibleSchemaVersion{} -> removeFile fp
+  withHieDb fp $ \writedb -> do
+    initConn writedb
+    chan <- newTQueueIO
+    withAsync (writerThread writedb chan) $ \_ -> do
+      withHieDb fp (flip k chan)
+  where
+    writerThread db chan = do
+      -- Clear the index of any files that might have been deleted since the last run
+      deleteMissingRealFiles db
+      _ <- garbageCollectTypeNames db
+      forever $ do
+        k <- atomically $ readTQueue chan
+        k db
+          `catch` \e@SQLError{} -> do
+            hPutStrLn stderr $ "SQLite error in worker, ignoring: " ++ show e
+          `catchAny` \e -> do
+            hPutStrLn stderr $ "Uncaught error in database worker, ignoring: " ++ show e
+
+
+getHieDbLoc :: FilePath -> IO FilePath
+getHieDbLoc dir = do
+  let db = dirHash++"-"++takeBaseName dir++"-"++VERSION_ghc <.> "hiedb"
+      dirHash = B.unpack $ B16.encode $ H.hash $ B.pack dir
+  cDir <- IO.getXdgDirectory IO.XdgCache cacheDir
+  createDirectoryIfMissing True cDir
+  pure (cDir </> db)
 
 -- | Given a root directory, return a Shake 'Action' which setups an
 -- 'IdeGhcSession' given a file.
@@ -113,6 +184,11 @@ loadSessionWithOptions SessionLoadingOptions{..} dir = do
   hscEnvs <- newVar Map.empty :: IO (Var HieMap)
   -- Mapping from a Filepath to HscEnv
   fileToFlags <- newVar Map.empty :: IO (Var FlagsMap)
+  -- Mapping from a Filepath to its 'hie.yaml' location.
+  -- Should hold the same Filepaths as 'fileToFlags', otherwise
+  -- they are inconsistent. So, everywhere you modify 'fileToFlags',
+  -- you have to modify 'filesMap' as well.
+  filesMap <- newVar HM.empty :: IO (Var FilesMap)
   -- Version of the mappings above
   version <- newVar 0
   let returnWithVersion fun = IdeGhcSession fun <$> liftIO (readVar version)
@@ -131,12 +207,11 @@ loadSessionWithOptions SessionLoadingOptions{..} dir = do
   runningCradle <- newVar dummyAs :: IO (Var (Async (IdeResult HscEnvEq,[FilePath])))
 
   return $ do
-    extras@ShakeExtras{logger, eventer, restartShakeSession,
-                       withIndefiniteProgress, ideNc, knownTargetsVar
+    extras@ShakeExtras{logger, restartShakeSession, ideNc, knownTargetsVar, lspEnv
                       } <- getShakeExtras
 
     IdeOptions{ optTesting = IdeTesting optTesting
-              , optCheckProject = checkProject
+              , optCheckProject = getCheckProject
               , optCustomDynFlags
               , optExtensions
               } <- getIdeOptions
@@ -271,6 +346,8 @@ loadSessionWithOptions SessionLoadingOptions{..} dir = do
 
           modifyVar_ fileToFlags $ \var -> do
               pure $ Map.insert hieYaml (HM.fromList (concatMap toFlagsMap all_targets)) var
+          modifyVar_ filesMap $ \var -> do
+              evaluate $ HM.union var (HM.fromList (zip (map fst $ concatMap toFlagsMap all_targets) (repeat hieYaml)))
 
           extendKnownTargets all_targets
 
@@ -279,6 +356,7 @@ loadSessionWithOptions SessionLoadingOptions{..} dir = do
           restartShakeSession []
 
           -- Typecheck all files in the project on startup
+          checkProject <- getCheckProject
           unless (null cs || not checkProject) $ do
                 cfps' <- liftIO $ filterM (IO.doesFileExist . fromNormalizedFilePath) (concatMap targetLocations cs)
                 void $ shakeEnqueue extras $ mkDelayedAction "InitialLoad" Debug $ void $ do
@@ -297,17 +375,19 @@ loadSessionWithOptions SessionLoadingOptions{..} dir = do
            lfp <- flip makeRelative cfp <$> getCurrentDirectory
            logInfo logger $ T.pack ("Consulting the cradle for " <> show lfp)
 
-           when (isNothing hieYaml) $ eventer $ notifyUserImplicitCradle lfp
+           when (isNothing hieYaml) $ mRunLspT lspEnv $
+             sendNotification SWindowShowMessage $ notifyUserImplicitCradle lfp
 
            cradle <- maybe (loadImplicitHieCradle $ addTrailingPathSeparator dir) loadCradle hieYaml
 
-           when optTesting $ eventer $ notifyCradleLoaded lfp
+           when optTesting $ mRunLspT lspEnv $
+            sendNotification (SCustomMethod "ghcide/cradle/loaded") (toJSON cfp)
 
            -- Display a user friendly progress message here: They probably don't know what a cradle is
            let progMsg = "Setting up " <> T.pack (takeBaseName (cradleRootDir cradle))
                          <> " (for " <> T.pack lfp <> ")"
-           eopts <- withIndefiniteProgress progMsg NotCancellable $
-             cradleToOptsAndLibDir cradle cfp
+           eopts <- mRunLspTCallback lspEnv (withIndefiniteProgress progMsg NotCancellable) $
+              cradleToOptsAndLibDir cradle cfp
 
            logDebug logger $ T.pack ("Session loading result: " <> show eopts)
            case eopts of
@@ -329,6 +409,8 @@ loadSessionWithOptions SessionLoadingOptions{..} dir = do
                let res = (map (renderCradleError ncfp) err, Nothing)
                modifyVar_ fileToFlags $ \var -> do
                  pure $ Map.insertWith HM.union hieYaml (HM.singleton ncfp (res, dep_info)) var
+               modifyVar_ filesMap $ \var -> do
+                 evaluate $ HM.insert ncfp hieYaml var
                return (res, maybe [] pure hieYaml ++ concatMap cradleErrorDependencies err)
 
     -- This caches the mapping from hie.yaml + Mod.hs -> [String]
@@ -358,8 +440,10 @@ loadSessionWithOptions SessionLoadingOptions{..} dir = do
     -- before attempting to do so.
     let getOptions :: FilePath -> IO (IdeResult HscEnvEq, [FilePath])
         getOptions file = do
+            ncfp <- toNormalizedFilePath' <$> canonicalizePath file
+            cachedHieYamlLocation <- HM.lookup ncfp <$> readVar filesMap
             hieYaml <- cradleLoc file
-            sessionOpts (hieYaml, file) `catch` \e ->
+            sessionOpts (join cachedHieYamlLocation <|> hieYaml, file) `catch` \e ->
                 return (([renderPackageSetupException file e], Nothing), maybe [] pure hieYaml)
 
     returnWithVersion $ \file -> do
@@ -543,7 +627,11 @@ renderCradleError nfp (CradleError _ _ec t) =
 -- See Note [Multi Cradle Dependency Info]
 type DependencyInfo = Map.Map FilePath (Maybe UTCTime)
 type HieMap = Map.Map (Maybe FilePath) (HscEnv, [RawComponentInfo])
+-- | Maps a "hie.yaml" location to all its Target Filepaths and options.
 type FlagsMap = Map.Map (Maybe FilePath) (HM.HashMap NormalizedFilePath (IdeResult HscEnvEq, DependencyInfo))
+-- | Maps a Filepath to its respective "hie.yaml" location.
+-- It aims to be the reverse of 'FlagsMap'.
+type FilesMap = HM.HashMap NormalizedFilePath (Maybe FilePath)
 
 -- This is pristine information about a component
 data RawComponentInfo = RawComponentInfo
@@ -709,24 +797,12 @@ getCacheDirsDefault prefix opts = do
 cacheDir :: String
 cacheDir = "ghcide"
 
-notifyUserImplicitCradle:: FilePath -> FromServerMessage
-notifyUserImplicitCradle fp =
-    NotShowMessage $
-    NotificationMessage "2.0" WindowShowMessage $ ShowMessageParams MtInfo $
-      "No [cradle](https://github.com/mpickering/hie-bios#hie-bios) found for "
-      <> T.pack fp <>
-      ".\n Proceeding with [implicit cradle](https://hackage.haskell.org/package/implicit-hie).\n\
-      \You should ignore this message, unless you see a 'Multi Cradle: No prefixes matched' error."
-
-notifyCradleLoaded :: FilePath -> FromServerMessage
-notifyCradleLoaded fp =
-    NotCustomServer $
-    NotificationMessage "2.0" (CustomServerMethod cradleLoadedMethod) $
-    toJSON fp
-
-cradleLoadedMethod :: T.Text
-cradleLoadedMethod = "ghcide/cradle/loaded"
-
+notifyUserImplicitCradle:: FilePath -> ShowMessageParams
+notifyUserImplicitCradle fp =ShowMessageParams MtWarning $
+  "No [cradle](https://github.com/mpickering/hie-bios#hie-bios) found for "
+  <> T.pack fp <>
+  ".\n Proceeding with [implicit cradle](https://hackage.haskell.org/package/implicit-hie).\n"<>
+  "You should ignore this message, unless you see a 'Multi Cradle: No prefixes matched' error."
 ----------------------------------------------------------------------------------------------------
 
 data PackageSetupException

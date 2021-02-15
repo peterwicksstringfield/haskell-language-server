@@ -15,7 +15,11 @@ module Development.IDE.GHC.Error
   , srcSpanToRange
   , realSrcSpanToRange
   , realSrcLocToPosition
+  , realSrcSpanToLocation
   , srcSpanToFilename
+  , rangeToSrcSpan
+  , rangeToRealSrcSpan
+  , positionToRealSrcLoc
   , zeroSpan
   , realSpan
   , isInsideSrcSpan
@@ -38,6 +42,7 @@ import Panic
 import           ErrUtils
 import           SrcLoc
 import qualified Outputable                 as Out
+import Data.String (fromString)
 
 
 
@@ -90,12 +95,30 @@ srcSpanToFilename :: SrcSpan -> Maybe FilePath
 srcSpanToFilename (UnhelpfulSpan _) = Nothing
 srcSpanToFilename (RealSrcSpan real) = Just $ FS.unpackFS $ srcSpanFile real
 
+realSrcSpanToLocation :: RealSrcSpan -> Location
+realSrcSpanToLocation real = Location file (realSrcSpanToRange real)
+  where file = fromNormalizedUri $ filePathToUri' $ toNormalizedFilePath' $ FS.unpackFS $ srcSpanFile real
+
 srcSpanToLocation :: SrcSpan -> Maybe Location
 srcSpanToLocation src = do
   fs <- srcSpanToFilename src
   rng <- srcSpanToRange src
   -- important that the URI's we produce have been properly normalized, otherwise they point at weird places in VS Code
   pure $ Location (fromNormalizedUri $ filePathToUri' $ toNormalizedFilePath' fs) rng
+
+rangeToSrcSpan :: NormalizedFilePath -> Range -> SrcSpan
+rangeToSrcSpan = fmap RealSrcSpan . rangeToRealSrcSpan
+
+rangeToRealSrcSpan
+    :: NormalizedFilePath -> Range -> RealSrcSpan
+rangeToRealSrcSpan nfp =
+    mkRealSrcSpan
+        <$> positionToRealSrcLoc nfp . _start
+        <*> positionToRealSrcLoc nfp . _end
+
+positionToRealSrcLoc :: NormalizedFilePath -> Position -> RealSrcLoc
+positionToRealSrcLoc nfp (Position l c)=
+    mkRealSrcLoc (fromString $ fromNormalizedFilePath nfp) (l + 1) (c + 1)
 
 isInsideSrcSpan :: Position -> SrcSpan -> Bool
 p `isInsideSrcSpan` r = case srcSpanToRange r of

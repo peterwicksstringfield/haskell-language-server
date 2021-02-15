@@ -1,49 +1,42 @@
-{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE DeriveAnyClass        #-}
 {-# LANGUAGE DeriveGeneric         #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE ViewPatterns          #-}
 
 -- | Provides code actions to add missing pragmas (whenever GHC suggests to)
 module Ide.Plugin.Pragmas
   (
       descriptor
-  -- ,   commands -- TODO: get rid of this
   ) where
 
 import           Control.Lens                    hiding (List)
-import           Data.Aeson
 import qualified Data.HashMap.Strict             as H
 import           Data.Maybe                      (catMaybes)
 import qualified Data.Text                       as T
 import           Development.IDE                 as D
-import qualified GHC.Generics                    as Generics
 import           Ide.Types
-import           Language.Haskell.LSP.Types
-import qualified Language.Haskell.LSP.Types      as J
-import qualified Language.Haskell.LSP.Types.Lens as J
+import           Language.LSP.Types
+import qualified Language.LSP.Types      as J
+import qualified Language.LSP.Types.Lens as J
 
 import           Control.Monad                   (join)
 import           Development.IDE.GHC.Compat
-import qualified Language.Haskell.LSP.Core       as LSP
-import qualified Language.Haskell.LSP.VFS        as VFS
+import qualified Language.LSP.Server       as LSP
+import qualified Language.LSP.VFS as VFS
+import qualified Text.Fuzzy as Fuzzy
+import Data.List.Extra (nubOrd)
+import Control.Monad.IO.Class
 
 -- ---------------------------------------------------------------------
 
 descriptor :: PluginId -> PluginDescriptor IdeState
 descriptor plId = (defaultPluginDescriptor plId)
-  { pluginCodeActionProvider = Just codeActionProvider
-  , pluginCompletionProvider = Just completion
+  { pluginHandlers = mkPluginHandler STextDocumentCodeAction codeActionProvider
+                  <> mkPluginHandler STextDocumentCompletion completion
   }
 
 -- ---------------------------------------------------------------------
-
--- | Parameters for the addPragma PluginCommand.
-data AddPragmaParams = AddPragmaParams
-  { file   :: J.Uri  -- ^ Uri of the file to add the pragma to
-  , pragma :: T.Text -- ^ Name of the Pragma to add
-  }
-  deriving (Show, Eq, Generics.Generic, ToJSON, FromJSON)
 
 -- | Add a Pragma to the given URI at the top of the file.
 -- Pragma is added to the first line of the Uri.
@@ -63,19 +56,19 @@ mkPragmaEdit uri pragmaName = res where
 -- ---------------------------------------------------------------------
 -- | Offer to add a missing Language Pragma to the top of a file.
 -- Pragmas are defined by a curated list of known pragmas, see 'possiblePragmas'.
-codeActionProvider :: CodeActionProvider IdeState
-codeActionProvider _ state _plId docId _ (J.CodeActionContext (J.List diags) _monly) = do
+codeActionProvider :: PluginMethodHandler IdeState TextDocumentCodeAction
+codeActionProvider state _plId (CodeActionParams _ _ docId _ (J.CodeActionContext (J.List diags) _monly)) = liftIO $ do
     let mFile = docId ^. J.uri & uriToFilePath <&> toNormalizedFilePath'
     pm <- fmap join $ runAction "addPragma" state $ getParsedModule `traverse` mFile
     let dflags = ms_hspp_opts . pm_mod_summary <$> pm
         -- Get all potential Pragmas for all diagnostics.
-        pragmas = concatMap (\d -> genPragma dflags (d ^. J.message)) diags
+        pragmas = nubOrd $ concatMap (\d -> genPragma dflags (d ^. J.message)) diags
     cmds <- mapM mkCodeAction pragmas
     return $ Right $ List cmds
       where
         mkCodeAction pragmaName = do
           let
-            codeAction = J.CACodeAction $ J.CodeAction title (Just J.CodeActionQuickFix) (Just (J.List [])) (Just edit) Nothing
+            codeAction = InR $ J.CodeAction title (Just J.CodeActionQuickFix) (Just (J.List [])) Nothing Nothing (Just edit) Nothing
             title = "Add \"" <> pragmaName <> "\""
             edit = mkPragmaEdit (docId ^. J.uri) pragmaName
           return codeAction
@@ -116,29 +109,43 @@ findPragma str = concatMap check possiblePragmas
 
 -- | All language pragmas, including the No- variants
 allPragmas :: [T.Text]
-allPragmas = concat
+allPragmas =
+  concat
     [ [name, "No" <> name]
     | FlagSpec{flagSpecName = T.pack -> name} <- xFlags
     ]
+  <>
+  -- These pragmas are not part of xFlags as they are not reversable
+  -- by prepending "No".
+  [ -- Safe Haskell
+    "Unsafe"
+  , "Trustworthy"
+  , "Safe"
+
+    -- Language Version Extensions
+  , "Haskell98"
+  , "Haskell2010"
+    -- Maybe, GHC 2021 after its release?
+  ]
 
 -- ---------------------------------------------------------------------
 
-completion :: CompletionProvider IdeState
-completion lspFuncs _ide complParams = do
+completion :: PluginMethodHandler IdeState TextDocumentCompletion
+completion _ide _ complParams = do
     let (TextDocumentIdentifier uri) = complParams ^. J.textDocument
         position = complParams ^. J.position
-    contents <- LSP.getVirtualFileFunc lspFuncs $ toNormalizedUri uri
-    fmap Right $ case (contents, uriToFilePath' uri) of
-        (Just cnts, Just _path) -> do
-            pfix <- VFS.getCompletionPrefix position cnts
-            return $ result pfix
+    contents <- LSP.getVirtualFile $ toNormalizedUri uri
+    fmap (Right . InL) $ case (contents, uriToFilePath' uri) of
+        (Just cnts, Just _path) ->
+            result <$> VFS.getCompletionPrefix position cnts
             where
                 result (Just pfix)
                     | "{-# LANGUAGE" `T.isPrefixOf` VFS.fullLine pfix
-                    = Completions $ List $ map buildCompletion allPragmas
+                    = List $ map buildCompletion
+                        (Fuzzy.simpleFilter (VFS.prefixText pfix) allPragmas)
                     | otherwise
-                    = Completions $ List []
-                result Nothing = Completions $ List []
+                    = List []
+                result Nothing = List []
                 buildCompletion p =
                     CompletionItem
                       { _label = p,
@@ -158,4 +165,4 @@ completion lspFuncs _ide complParams = do
                         _command = Nothing,
                         _xdata = Nothing
                       }
-        _ -> return $ Completions $ List []
+        _ -> return $ List []

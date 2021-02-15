@@ -5,14 +5,16 @@ module Completion(tests) where
 import Control.Monad.IO.Class
 import Control.Lens hiding ((.=))
 import Data.Aeson (object, (.=))
-import Language.Haskell.LSP.Test
-import Language.Haskell.LSP.Types
-import Language.Haskell.LSP.Types.Lens hiding (applyEdit)
+import Language.LSP.Test
+import Language.LSP.Types
+import Language.LSP.Types.Lens hiding (applyEdit)
 import Test.Hls.Util
 import Test.Tasty
 import Test.Tasty.ExpectedFailure (ignoreTestBecause)
 import Test.Tasty.HUnit
 import qualified Data.Text as T
+import Data.Default (def)
+import Ide.Plugin.Config (Config (maxCompletions))
 
 tests :: TestTree
 tests = testGroup "completions" [
@@ -40,8 +42,8 @@ tests = testGroup "completions" [
 
          compls <- getCompletions doc (Position 5 9)
          let item = head $ filter ((== "putStrLn") . (^. label)) compls
-         resolvedRes <- request CompletionItemResolve item
-         let Right (resolved :: CompletionItem) = resolvedRes ^. result
+         resolvedRes <- request SCompletionItemResolve item
+         let Right resolved = resolvedRes ^. result
          liftIO $ print resolved
          liftIO $ do
              resolved ^. label @?= "putStrLn"
@@ -102,7 +104,7 @@ tests = testGroup "completions" [
          let te = TextEdit (Range (Position 0 13) (Position 0 31)) "Str"
          _ <- applyEdit doc te
 
-         compls <- getCompletions doc (Position 0 24)
+         compls <- getCompletions doc (Position 0 16)
          let item = head $ filter ((== "Strict") . (^. label)) compls
          liftIO $ do
              item ^. label @?= "Strict"
@@ -116,7 +118,7 @@ tests = testGroup "completions" [
          let te = TextEdit (Range (Position 0 13) (Position 0 31)) "NoOverload"
          _ <- applyEdit doc te
 
-         compls <- getCompletions doc (Position 0 24)
+         compls <- getCompletions doc (Position 0 23)
          let item = head $ filter ((== "NoOverloadedStrings") . (^. label)) compls
          liftIO $ do
              item ^. label @?= "NoOverloadedStrings"
@@ -221,6 +223,12 @@ tests = testGroup "completions" [
          liftIO $
              item ^. detail @?= Just ":: (a -> b -> c) -> b -> a -> c"
 
+     , testCase "maxCompletions" $ runSession hlsCommand fullCaps "test/testdata/completion" $ do
+         doc <- openDoc "Completion.hs" "haskell"
+
+         compls <- getCompletions doc (Position 5 7)
+         liftIO $ length compls @?= maxCompletions def
+
      , contextTests
      , snippetTests
     ]
@@ -278,8 +286,8 @@ snippetTests = testGroup "snippets" [
         liftIO $ do
             item ^. label @?= "filter"
             item ^. kind @?= Just CiFunction
-            item ^. insertTextFormat @?= Just Snippet
-            item ^. insertText @?= Just "filter ${1:a -> Bool} ${2:[a]}"
+            item ^. insertTextFormat @?= Just PlainText
+            item ^. insertText @?= Nothing
 
     , testCase "work for infix functions in backticks" $ runSession hlsCommand fullCaps "test/testdata/completion" $ do
         doc <- openDoc "Completion.hs" "haskell"
@@ -292,8 +300,8 @@ snippetTests = testGroup "snippets" [
         liftIO $ do
             item ^. label @?= "filter"
             item ^. kind @?= Just CiFunction
-            item ^. insertTextFormat @?= Just Snippet
-            item ^. insertText @?= Just "filter ${1:a -> Bool} ${2:[a]}"
+            item ^. insertTextFormat @?= Just PlainText
+            item ^. insertText @?= Nothing
 
     , testCase "work for qualified infix functions" $ runSession hlsCommand fullCaps "test/testdata/completion" $ do
         doc <- openDoc "Completion.hs" "haskell"
@@ -306,8 +314,8 @@ snippetTests = testGroup "snippets" [
         liftIO $ do
             item ^. label @?= "intersperse"
             item ^. kind @?= Just CiFunction
-            item ^. insertTextFormat @?= Just Snippet
-            item ^. insertText @?= Just "intersperse ${1:a} ${2:[a]}"
+            item ^. insertTextFormat @?= Just PlainText
+            item ^. insertText @?= Nothing
 
     , testCase "work for qualified infix functions in backticks" $ runSession hlsCommand fullCaps "test/testdata/completion" $ do
         doc <- openDoc "Completion.hs" "haskell"
@@ -320,15 +328,15 @@ snippetTests = testGroup "snippets" [
         liftIO $ do
             item ^. label @?= "intersperse"
             item ^. kind @?= Just CiFunction
-            item ^. insertTextFormat @?= Just Snippet
-            item ^. insertText @?= Just "intersperse ${1:a} ${2:[a]}"
+            item ^. insertTextFormat @?= Just PlainText
+            item ^. insertText @?= Nothing
 
     , testCase "respects lsp configuration" $ runSession hlsCommand fullCaps "test/testdata/completion" $ do
         doc <- openDoc "Completion.hs" "haskell"
 
         let config = object [ "haskell" .= object ["completionSnippetsOn" .= False]]
 
-        sendNotification WorkspaceDidChangeConfiguration
+        sendNotification SWorkspaceDidChangeConfiguration
                         (DidChangeConfigurationParams config)
 
         checkNoSnippets doc

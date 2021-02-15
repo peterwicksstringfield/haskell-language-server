@@ -21,7 +21,8 @@ module Development.IDE.Core.Compile
   , generateObjectCode
   , generateByteCode
   , generateHieAsts
-  , writeHieFile
+  , writeAndIndexHieFile
+  , indexHieFile
   , writeHiFile
   , getModSummaryFromImports
   , loadHieFile
@@ -37,13 +38,17 @@ import Development.IDE.Core.Preprocessor
 import Development.IDE.Core.Shake
 import Development.IDE.GHC.Error
 import Development.IDE.GHC.Warnings
+import Development.IDE.Spans.Common
 import Development.IDE.Types.Diagnostics
 import Development.IDE.GHC.Orphans()
 import Development.IDE.GHC.Util
 import Development.IDE.Types.Options
 import Development.IDE.Types.Location
+import Outputable hiding ((<>))
 
-import Language.Haskell.LSP.Types (DiagnosticTag(..))
+import HieDb
+
+import Language.LSP.Types (DiagnosticTag(..))
 
 import LoadIface (loadModuleInterface)
 import DriverPhases
@@ -68,7 +73,7 @@ import           GhcPlugins                     as GHC hiding (fst3, (<>))
 import           HscMain                        (makeSimpleDetails, hscDesugar, hscTypecheckRename, hscSimplify, hscGenHardCode, hscInteractive)
 import           MkIface
 import           StringBuffer                   as SB
-import           TcRnMonad
+import           TcRnMonad                      hiding (newUnique)
 import           TcIface                        (typecheckIface)
 import           TidyPgm
 import           Hooks
@@ -99,6 +104,18 @@ import qualified GHC.LanguageExtensions as LangExt
 import PrelNames
 import HeaderInfo
 import Maybes (orElse)
+
+import qualified Data.HashMap.Strict as HashMap
+import qualified Language.LSP.Types as LSP
+import qualified Language.LSP.Server as LSP
+import Control.Concurrent.STM hiding (orElse)
+import Control.Concurrent.Extra
+import Data.Functor
+import Data.Unique
+import GHC.Fingerprint
+import Data.Coerce
+import Data.Aeson (toJSON)
+import Data.Tuple.Extra (dupe)
 
 -- | Given a string buffer, return the string (after preprocessing) and the 'ParsedModule'.
 parseModule
@@ -459,12 +476,128 @@ spliceExpresions Splices{..} =
         , DL.fromList $ map fst awSplices
         ]
 
-writeHieFile :: HscEnv -> ModSummary -> [GHC.AvailInfo] -> HieASTs Type -> BS.ByteString -> IO [FileDiagnostic]
-writeHieFile hscEnv mod_summary exports ast source =
+-- | In addition to indexing the `.hie` file, this function is responsible for
+-- maintaining the 'IndexQueue' state and notfiying the user about indexing
+-- progress.
+--
+-- We maintain a record of all pending index operations in the 'indexPending'
+-- TVar.
+-- When 'indexHieFile' is called, it must check to ensure that the file hasn't
+-- already be queued up for indexing. If it has, then we can just skip it
+--
+-- Otherwise, we record the current file as pending and write an indexing
+-- operation to the queue
+--
+-- When the indexing operation is picked up and executed by the worker thread,
+-- the first thing it does is ensure that a newer index for the same file hasn't
+-- been scheduled by looking at 'indexPending'. If a newer index has been
+-- scheduled, we can safely skip this one
+--
+-- Otherwise, we start or continue a progress reporting session, telling it
+-- about progress so far and the current file we are attempting to index. Then
+-- we can go ahead and call in to hiedb to actually do the indexing operation
+--
+-- Once this completes, we have to update the 'IndexQueue' state. First, we
+-- must remove the just indexed file from 'indexPending' Then we check if
+-- 'indexPending' is now empty. In that case, we end the progress session and
+-- report the total number of file indexed. We also set the 'indexCompleted'
+-- TVar to 0 in order to set it up for a fresh indexing session. Otherwise, we
+-- can just increment the 'indexCompleted' TVar and exit.
+--
+indexHieFile :: ShakeExtras -> ModSummary -> NormalizedFilePath -> Fingerprint -> Compat.HieFile -> IO ()
+indexHieFile se mod_summary srcPath hash hf = atomically $ do
+  pending <- readTVar indexPending
+  case HashMap.lookup srcPath pending of
+    Just pendingHash | pendingHash == hash -> pure () -- An index is already scheduled
+    _ -> do
+      modifyTVar' indexPending $ HashMap.insert srcPath hash
+      writeTQueue indexQueue $ \db -> do
+        -- We are now in the worker thread
+        -- Check if a newer index of this file has been scheduled, and if so skip this one
+        newerScheduled <- atomically $ do
+          pending <- readTVar indexPending
+          pure $ case HashMap.lookup srcPath pending of
+            Nothing -> False
+            -- If the hash in the pending list doesn't match the current hash, then skip
+            Just pendingHash -> pendingHash /= hash
+        unless newerScheduled $ do
+          pre
+          addRefsFromLoaded db targetPath (RealFile $ fromNormalizedFilePath srcPath) hash hf
+          post
+  where
+    mod_location    = ms_location mod_summary
+    targetPath      = Compat.ml_hie_file mod_location
+    HieDbWriter{..} = hiedbWriter se
+
+    -- Get a progress token to report progress and update it for the current file
+    pre = do
+      tok <- modifyVar indexProgressToken $ fmap dupe . \case
+        x@(Just _) -> pure x
+        -- Create a token if we don't already have one
+        Nothing -> do
+          case lspEnv se of
+            Nothing -> pure Nothing
+            Just env -> LSP.runLspT env $ do
+              u <- LSP.ProgressTextToken . T.pack . show . hashUnique <$> liftIO newUnique
+              -- TODO: Wait for the progress create response to use the token
+              _ <- LSP.sendRequest LSP.SWindowWorkDoneProgressCreate (LSP.WorkDoneProgressCreateParams u) (const $ pure ())
+              LSP.sendNotification LSP.SProgress $ LSP.ProgressParams u $
+                LSP.Begin $ LSP.WorkDoneProgressBeginParams
+                  { _title = "Indexing references from:"
+                  , _cancellable = Nothing
+                  , _message = Nothing
+                  , _percentage = Nothing
+                  }
+              pure (Just u)
+
+      (!done, !remaining) <- atomically $ do
+        done <- readTVar indexCompleted
+        remaining <- HashMap.size <$> readTVar indexPending
+        pure (done, remaining)
+
+      let progress = " (" <> T.pack (show done) <> "/" <> T.pack (show $ done + remaining) <> ")..."
+
+      whenJust (lspEnv se) $ \env -> whenJust tok $ \tok -> LSP.runLspT env $
+        LSP.sendNotification LSP.SProgress $ LSP.ProgressParams tok $
+          LSP.Report $ LSP.WorkDoneProgressReportParams
+            { _cancellable = Nothing
+            , _message = Just $ T.pack (show srcPath) <> progress
+            , _percentage = Nothing
+            }
+
+    -- Report the progress once we are done indexing this file
+    post = do
+      mdone <- atomically $ do
+        -- Remove current element from pending
+        pending <- stateTVar indexPending $
+          dupe . HashMap.update (\pendingHash -> guard (pendingHash /= hash) $> pendingHash) srcPath
+        modifyTVar' indexCompleted (+1)
+        -- If we are done, report and reset completed
+        whenMaybe (HashMap.null pending) $
+          swapTVar indexCompleted 0
+      whenJust (lspEnv se) $ \env -> LSP.runLspT env $
+        when (coerce $ ideTesting se) $
+          LSP.sendNotification (LSP.SCustomMethod "ghcide/reference/ready") $
+            toJSON $ fromNormalizedFilePath srcPath
+      whenJust mdone $ \done ->
+        modifyVar_ indexProgressToken $ \tok -> do
+          whenJust (lspEnv se) $ \env -> LSP.runLspT env $
+            whenJust tok $ \tok ->
+              LSP.sendNotification LSP.SProgress $ LSP.ProgressParams tok $
+                LSP.End $ LSP.WorkDoneProgressEndParams
+                  { _message = Just $ "Finished indexing " <> T.pack (show done) <> " files"
+                  }
+          -- We are done with the current indexing cycle, so destroy the token
+          pure Nothing
+
+writeAndIndexHieFile :: HscEnv -> ShakeExtras -> ModSummary -> NormalizedFilePath -> [GHC.AvailInfo] -> HieASTs Type -> BS.ByteString -> IO [FileDiagnostic]
+writeAndIndexHieFile hscEnv se mod_summary srcPath exports ast source =
   handleGenerationErrors dflags "extended interface write/compression" $ do
     hf <- runHsc hscEnv $
       GHC.mkHieFile' mod_summary exports ast source
     atomicFileWrite targetPath $ flip GHC.writeHieFile hf
+    hash <- getFileHash targetPath
+    indexHieFile se mod_summary srcPath hash hf
   where
     dflags       = hsc_dflags hscEnv
     mod_location = ms_location mod_summary
@@ -472,7 +605,7 @@ writeHieFile hscEnv mod_summary exports ast source =
 
 writeHiFile :: HscEnv -> HiFileResult -> IO [FileDiagnostic]
 writeHiFile hscEnv tc =
-  handleGenerationErrors dflags "interface generation" $ do
+  handleGenerationErrors dflags "interface write" $ do
     atomicFileWrite targetPath $ \fp ->
       writeIfaceFile dflags fp modIface
   where
@@ -805,7 +938,7 @@ getDocsBatch hsc_env _mod _names = do
                else pure (Right ( Map.lookup name dmap
                                 , Map.findWithDefault Map.empty name amap))
     case res of
-        Just x -> return $ map (first prettyPrint) x
+        Just x -> return $ map (first $ T.unpack . showGhc) x
         Nothing -> throwErrors errs
   where
     throwErrors = liftIO . throwIO . mkSrcErr

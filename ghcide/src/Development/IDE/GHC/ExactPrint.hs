@@ -8,6 +8,7 @@
 module Development.IDE.GHC.ExactPrint
     ( Graft(..),
       graft,
+      graftWithoutParentheses,
       graftDecls,
       graftDeclsWithM,
       annotate,
@@ -54,8 +55,8 @@ import Generics.SYB
 import Ide.PluginUtils
 import Language.Haskell.GHC.ExactPrint
 import Language.Haskell.GHC.ExactPrint.Parsers
-import Language.Haskell.LSP.Types
-import Language.Haskell.LSP.Types.Capabilities (ClientCapabilities)
+import Language.LSP.Types
+import Language.LSP.Types.Capabilities (ClientCapabilities)
 import Outputable (Outputable, ppr, showSDoc)
 import Retrie.ExactPrint hiding (parseDecl, parseExpr, parsePattern, parseType)
 import Parser (parseIdentifier)
@@ -74,10 +75,10 @@ instance NFData GetAnnotatedParsedSource
 instance Binary GetAnnotatedParsedSource
 type instance RuleResult GetAnnotatedParsedSource = Annotated ParsedSource
 
--- | Get the latest version of the annotated parse source.
+-- | Get the latest version of the annotated parse source with comments.
 getAnnotatedParsedSourceRule :: Rules ()
 getAnnotatedParsedSourceRule = define $ \GetAnnotatedParsedSource nfp -> do
-  pm <- use GetParsedModule nfp
+  pm <- use GetParsedModuleWithComments nfp
   return ([], fmap annotateParsedSource pm)
 
 annotateParsedSource :: ParsedModule -> Annotated ParsedSource
@@ -179,8 +180,18 @@ graft ::
     SrcSpan ->
     Located ast ->
     Graft (Either String) a
-graft dst val = Graft $ \dflags a -> do
-    (anns, val') <- annotate dflags $ maybeParensAST val
+graft dst = graftWithoutParentheses dst . maybeParensAST
+
+-- | Like 'graft', but trusts that you have correctly inserted the parentheses
+-- yourself. If you haven't, the resulting AST will not be valid!
+graftWithoutParentheses ::
+    forall ast a.
+    (Data a, ASTElement ast) =>
+    SrcSpan ->
+    Located ast ->
+    Graft (Either String) a
+graftWithoutParentheses dst val = Graft $ \dflags a -> do
+    (anns, val') <- annotate dflags val
     modifyAnnsT $ mappend anns
     pure $
         everywhere'
@@ -312,6 +323,10 @@ instance p ~ GhcPs => ASTElement (HsType p) where
 
 instance p ~ GhcPs => ASTElement (HsDecl p) where
     parseAST = parseDecl
+    maybeParensAST = id
+
+instance p ~ GhcPs => ASTElement (ImportDecl p) where
+    parseAST = parseImport
     maybeParensAST = id
 
 instance ASTElement RdrName where

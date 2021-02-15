@@ -18,12 +18,11 @@ import           Control.Monad.Trans.Class
 import           Control.Monad.Trans.Maybe
 import           Data.Aeson
 import           Data.Char
-import qualified Data.HashMap.Strict as H
 import           Data.List
 import qualified Data.Map.Strict as Map
 import           Data.Maybe
 import qualified Data.Text as T
-import           Development.IDE
+import           Development.IDE hiding (pluginHandlers)
 import           Development.IDE.Core.PositionMapping (fromCurrentRange, toCurrentRange)
 import           Development.IDE.GHC.Compat hiding (getLoc)
 import           Development.IDE.Spans.AtPoint
@@ -34,9 +33,9 @@ import           Ide.Types
 import           Language.Haskell.GHC.ExactPrint
 import           Language.Haskell.GHC.ExactPrint.Parsers (parseDecl)
 import           Language.Haskell.GHC.ExactPrint.Types hiding (GhcPs, Parens)
-import           Language.Haskell.LSP.Core
-import           Language.Haskell.LSP.Types
-import qualified Language.Haskell.LSP.Types.Lens as J
+import           Language.LSP.Server
+import           Language.LSP.Types
+import qualified Language.LSP.Types.Lens as J
 import           SrcLoc
 import           TcEnv
 import           TcRnMonad
@@ -44,7 +43,7 @@ import           TcRnMonad
 descriptor :: PluginId -> PluginDescriptor IdeState
 descriptor plId = (defaultPluginDescriptor plId)
   { pluginCommands = commands
-  , pluginCodeActionProvider = Just codeAction
+  , pluginHandlers = mkPluginHandler STextDocumentCodeAction codeAction
   }
 
 commands :: [PluginCommand IdeState]
@@ -61,25 +60,28 @@ data AddMinimalMethodsParams = AddMinimalMethodsParams
   deriving (Show, Eq, Generics.Generic, ToJSON, FromJSON)
 
 addMethodPlaceholders :: CommandFunction IdeState AddMinimalMethodsParams
-addMethodPlaceholders lf state AddMinimalMethodsParams{..} = fmap (fromMaybe errorResult) . runMaybeT $ do
-  docPath <- MaybeT . pure . uriToNormalizedFilePath $ toNormalizedUri uri
-  pm <- MaybeT . runAction "classplugin" state $ use GetParsedModule docPath
-  let
-    ps = pm_parsed_source pm
-    anns = relativiseApiAnns ps (pm_annotations pm)
-    old = T.pack $ exactPrint ps anns
+addMethodPlaceholders state AddMinimalMethodsParams{..} = do
+  caps <- getClientCapabilities
+  medit <- liftIO $ runMaybeT $ do
+    docPath <- MaybeT . pure . uriToNormalizedFilePath $ toNormalizedUri uri
+    pm <- MaybeT . runAction "classplugin" state $ use GetParsedModule docPath
+    let
+      ps = pm_parsed_source pm
+      anns = relativiseApiAnns ps (pm_annotations pm)
+      old = T.pack $ exactPrint ps anns
 
-  (hsc_dflags . hscEnv -> df) <- MaybeT . runAction "classplugin" state $ use GhcSessionDeps docPath
-  List (unzip -> (mAnns, mDecls)) <- MaybeT . pure $ traverse (makeMethodDecl df) methodGroup
-  let
-    (ps', (anns', _), _) = runTransform (mergeAnns (mergeAnnList mAnns) anns) (addMethodDecls ps mDecls)
-    new = T.pack $ exactPrint ps' anns'
+    (hsc_dflags . hscEnv -> df) <- MaybeT . runAction "classplugin" state $ use GhcSessionDeps docPath
+    List (unzip -> (mAnns, mDecls)) <- MaybeT . pure $ traverse (makeMethodDecl df) methodGroup
+    let
+      (ps', (anns', _), _) = runTransform (mergeAnns (mergeAnnList mAnns) anns) (addMethodDecls ps mDecls)
+      new = T.pack $ exactPrint ps' anns'
 
-  pure (Right Null, Just (WorkspaceApplyEdit, ApplyWorkspaceEditParams (workspaceEdit caps old new)))
+    pure (workspaceEdit caps old new)
+  forM_ medit $ \edit ->
+    sendRequest SWorkspaceApplyEdit (ApplyWorkspaceEditParams Nothing edit) (\_ -> pure ())
+  pure (Right Null)
   where
-    errorResult = (Right Null, Nothing)
 
-    caps = clientCapabilities lf
     indent = 2
 
     makeMethodDecl df mName =
@@ -127,8 +129,8 @@ addMethodPlaceholders lf state AddMinimalMethodsParams{..} = fmap (fromMaybe err
 -- |
 -- This implementation is ad-hoc in a sense that the diagnostic detection mechanism is
 -- sensitive to the format of diagnostic messages from GHC.
-codeAction :: CodeActionProvider IdeState
-codeAction _ state plId docId _ context = fmap (fromMaybe errorResult) . runMaybeT $ do
+codeAction :: PluginMethodHandler IdeState TextDocumentCodeAction
+codeAction state plId (CodeActionParams _ _ docId _ context) = liftIO $ fmap (fromMaybe errorResult) . runMaybeT $ do
   docPath <- MaybeT . pure . uriToNormalizedFilePath $ toNormalizedUri uri
   actions <- join <$> mapM (mkActions docPath) methodDiags
   pure . Right . List $ actions
@@ -148,8 +150,7 @@ codeAction _ state plId docId _ context = fmap (fromMaybe errorResult) . runMayb
         range = diag ^. J.range
 
         mkAction methodGroup
-          = mkCodeAction title
-            <$> mkLspCommand plId "addMinimalMethodPlaceholders" title (Just cmdParams)
+          = pure $ mkCodeAction title $ mkLspCommand plId "addMinimalMethodPlaceholders" title (Just cmdParams)
           where
             title = mkTitle methodGroup
             cmdParams = mkCmdParams methodGroup
@@ -161,18 +162,20 @@ codeAction _ state plId docId _ context = fmap (fromMaybe errorResult) . runMayb
         mkCmdParams methodGroup = [toJSON (AddMinimalMethodsParams uri range (List methodGroup))]
 
         mkCodeAction title
-          = CACodeAction
-          . CodeAction title (Just CodeActionQuickFix) (Just (List [])) Nothing
+          = InR
+          . CodeAction title (Just CodeActionQuickFix) (Just (List [])) Nothing Nothing Nothing
           . Just
 
     findClassIdentifier docPath range = do
-      (hieAst -> hf, pmap) <- MaybeT . runAction "classplugin" state $ useWithStale GetHieAst docPath
-      pure
-        $ head . head
-        $ pointCommand hf (fromJust (fromCurrentRange pmap range) ^. J.start & J.character -~ 1)
-          ( (Map.keys . Map.filter isClassNodeIdentifier . nodeIdentifiers . nodeInfo)
-            <=< nodeChildren
-          )
+      (hieAstResult, pmap) <- MaybeT . runAction "classplugin" state $ useWithStale GetHieAst docPath
+      case hieAstResult of
+        HAR {hieAst = hf} ->
+          pure
+            $ head . head
+            $ pointCommand hf (fromJust (fromCurrentRange pmap range) ^. J.start & J.character -~ 1)
+              ( (Map.keys . Map.filter isClassNodeIdentifier . nodeIdentifiers . nodeInfo)
+                <=< nodeChildren
+              )
 
     findClassFromIdentifier docPath (Right name) = do
       (hscEnv -> hscenv, _) <- MaybeT . runAction "classplugin" state $ useWithStale GhcSessionDeps docPath

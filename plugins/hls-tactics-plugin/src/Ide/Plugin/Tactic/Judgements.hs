@@ -1,4 +1,3 @@
-{-# LANGUAGE DataKinds        #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ViewPatterns     #-}
 
@@ -26,8 +25,11 @@ module Ide.Plugin.Tactic.Judgements
   , mkFirstJudgement
   , hypothesisFromBindings
   , isTopLevel
+  , hyNamesInScope
+  , hyByName
   ) where
 
+import           Control.Arrow
 import           Control.Lens hiding (Context)
 import           Data.Bool
 import           Data.Char
@@ -48,20 +50,20 @@ import           Type
 
 ------------------------------------------------------------------------------
 -- | Given a 'SrcSpan' and a 'Bindings', create a hypothesis.
-hypothesisFromBindings :: RealSrcSpan -> Bindings -> Map OccName (HyInfo CType)
+hypothesisFromBindings :: RealSrcSpan -> Bindings -> Hypothesis CType
 hypothesisFromBindings span bs = buildHypothesis $ getLocalScope bs span
 
 
 ------------------------------------------------------------------------------
 -- | Convert a @Set Id@ into a hypothesis.
-buildHypothesis :: [(Name, Maybe Type)] -> Map OccName (HyInfo CType)
+buildHypothesis :: [(Name, Maybe Type)] -> Hypothesis CType
 buildHypothesis
-  = M.fromList
+  = Hypothesis
   . mapMaybe go
   where
     go (occName -> occ, t)
       | Just ty <- t
-      , isAlpha . head . occNameString $ occ = Just (occ, HyInfo UserPrv $ CType ty)
+      , isAlpha . head . occNameString $ occ = Just $ HyInfo occ UserPrv $ CType ty
       | otherwise = Nothing
 
 
@@ -98,8 +100,8 @@ introducing
     -> Judgement' a
     -> Judgement' a
 introducing f ns =
-  field @"_jHypothesis" <>~ M.fromList (zip [0..] ns <&>
-    \(pos, (name, ty)) -> (name, HyInfo (f pos) ty))
+  field @"_jHypothesis" <>~ (Hypothesis $ zip [0..] ns <&>
+    \(pos, (name, ty)) -> HyInfo name (f pos) ty)
 
 
 ------------------------------------------------------------------------------
@@ -151,7 +153,7 @@ filterAncestry
     -> Judgement
     -> Judgement
 filterAncestry ancestry reason jdg =
-    disallowing reason (M.keys $ M.filterWithKey go $ jHypothesis jdg) jdg
+    disallowing reason (M.keys $ M.filterWithKey go $ hyByName $ jHypothesis jdg) jdg
   where
     go name _
       = isNothing $ hasPositionalAncestry ancestry jdg name
@@ -172,7 +174,7 @@ findPositionVal :: Judgement' a -> OccName -> Int -> Maybe OccName
 findPositionVal jdg defn pos = listToMaybe $ do
   -- It's important to inspect the entire hypothesis here, as we need to trace
   -- ancstry through potentially disallowed terms in the hypothesis.
-  (name, hi) <- M.toList $ M.map (overProvenance expandDisallowed) $ jEntireHypothesis jdg
+  (name, hi) <- M.toList $ M.map (overProvenance expandDisallowed) $ hyByName $ jEntireHypothesis jdg
   case hi_provenance hi of
     TopLevelArgPrv defn' pos'
       | defn == defn'
@@ -188,7 +190,7 @@ findPositionVal jdg defn pos = listToMaybe $ do
 -- 'filterSameTypeFromOtherPositions'.
 findDconPositionVals :: Judgement' a -> DataCon -> Int -> [OccName]
 findDconPositionVals jdg dcon pos = do
-  (name, hi) <- M.toList $ jHypothesis jdg
+  (name, hi) <- M.toList $ hyByName $ jHypothesis jdg
   case hi_provenance hi of
     PatternMatchPrv pv
       | pv_datacon  pv == Uniquely dcon
@@ -203,14 +205,15 @@ findDconPositionVals jdg dcon pos = do
 -- other term which might match.
 filterSameTypeFromOtherPositions :: DataCon -> Int -> Judgement -> Judgement
 filterSameTypeFromOtherPositions dcon pos jdg =
-  let hy = jHypothesis
+  let hy = hyByName
+         . jHypothesis
          $ filterAncestry
              (findDconPositionVals jdg dcon pos)
              (WrongBranch pos)
              jdg
       tys = S.fromList $ hi_type <$> M.elems hy
       to_remove =
-        M.filter (flip S.member tys . hi_type) (jHypothesis jdg)
+        M.filter (flip S.member tys . hi_type) (hyByName $ jHypothesis jdg)
           M.\\ hy
    in disallowing Shadowed (M.keys to_remove) jdg
 
@@ -269,8 +272,8 @@ introducingPat scrutinee dc ns jdg
 -- them from 'jHypothesis', but not from 'jEntireHypothesis'.
 disallowing :: DisallowReason -> [OccName] -> Judgement' a -> Judgement' a
 disallowing reason (S.fromList -> ns) =
-  field @"_jHypothesis" %~ M.mapWithKey (\name hi ->
-    if name `S.member` ns
+  field @"_jHypothesis" %~ (\z -> Hypothesis . flip fmap (unHypothesis z) $ \hi ->
+    if $ hi_name hi `S.member` ns
       then overProvenance (DisallowedPrv reason) hi
       else hi
                            )
@@ -279,20 +282,28 @@ disallowing reason (S.fromList -> ns) =
 ------------------------------------------------------------------------------
 -- | The hypothesis, consisting of local terms and the ambient environment
 -- (impors and class methods.) Hides disallowed values.
-jHypothesis :: Judgement' a -> Map OccName (HyInfo a)
-jHypothesis = M.filter (not . isDisallowed . hi_provenance) . jEntireHypothesis
+jHypothesis :: Judgement' a -> Hypothesis a
+jHypothesis
+  = Hypothesis
+  . filter (not . isDisallowed . hi_provenance)
+  . unHypothesis
+  . jEntireHypothesis
 
 
 ------------------------------------------------------------------------------
 -- | The whole hypothesis, including things disallowed.
-jEntireHypothesis :: Judgement' a -> Map OccName (HyInfo a)
+jEntireHypothesis :: Judgement' a -> Hypothesis a
 jEntireHypothesis = _jHypothesis
 
 
 ------------------------------------------------------------------------------
 -- | Just the local hypothesis.
-jLocalHypothesis :: Judgement' a -> Map OccName (HyInfo a)
-jLocalHypothesis = M.filter (isLocalHypothesis . hi_provenance) . jHypothesis
+jLocalHypothesis :: Judgement' a -> Hypothesis a
+jLocalHypothesis
+  = Hypothesis
+  . filter (isLocalHypothesis . hi_provenance)
+  . unHypothesis
+  . jHypothesis
 
 
 ------------------------------------------------------------------------------
@@ -307,9 +318,29 @@ unsetIsTopHole = field @"_jIsTopHole" .~ False
 
 
 ------------------------------------------------------------------------------
+-- | What names are currently in scope in the hypothesis?
+hyNamesInScope :: Hypothesis a -> Set OccName
+hyNamesInScope = M.keysSet . hyByName
+
+
+------------------------------------------------------------------------------
+-- | Fold a hypothesis into a single mapping from name to info. This
+-- unavoidably will cause duplicate names (things like methods) to shadow one
+-- another.
+hyByName :: Hypothesis a -> Map OccName (HyInfo a)
+hyByName
+  = M.fromList
+  . fmap (hi_name &&& id)
+  . unHypothesis
+
+
+------------------------------------------------------------------------------
 -- | Only the hypothesis members which are pattern vals
 jPatHypothesis :: Judgement' a -> Map OccName PatVal
-jPatHypothesis = M.mapMaybe (getPatVal . hi_provenance) . jHypothesis
+jPatHypothesis
+  = M.mapMaybe (getPatVal . hi_provenance)
+  . hyByName
+  . jHypothesis
 
 
 getPatVal :: Provenance-> Maybe PatVal
@@ -328,7 +359,7 @@ substJdg subst = fmap $ coerce . substTy subst . coerce
 
 
 mkFirstJudgement
-    :: M.Map OccName (HyInfo CType)
+    :: Hypothesis CType
     -> Bool  -- ^ are we in the top level rhs hole?
     -> Type
     -> Judgement' CType

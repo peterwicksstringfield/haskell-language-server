@@ -1,12 +1,20 @@
 # haskell-language-server
 
+![haskell-language-server][logo]
+
+[![Hackage][badge-hackage]][hackage]
 [![License Apache 2.0][badge-license]][license]
 [![CircleCI][badge-circleci]][circleci]
+![Github Testing Workflow](https://github.com/haskell/haskell-language-server/workflows/Testing/badge.svg)
+![Github Nix Workflow](https://github.com/haskell/haskell-language-server/workflows/Nix/badge.svg)
 
+[logo]: ./docs/logos/logo-256.png
 [badge-license]: https://img.shields.io/badge/license-Apache2-green.svg?dummy
 [license]: https://github.com/haskell/haskell-language-server/blob/master/LICENSE
 [badge-circleci]: https://img.shields.io/circleci/project/github/haskell/haskell-language-server/master.svg
 [circleci]: https://circleci.com/gh/haskell/haskell-language-server/
+[badge-hackage]: https://img.shields.io/hackage/v/haskell-language-server.svg?logo=haskell
+[hackage]: https://hackage.haskell.org/package/haskell-language-server
 
 Integration point for [ghcide](https://github.com/haskell/ghcide) and [haskell-ide-engine](https://github.com/haskell/haskell-ide-engine). One IDE to rule
 them all. Read the [project's
@@ -251,6 +259,8 @@ If your desired ghc has been found, you use it to install haskell-language-serve
 Direct installation from Hackage, while possible via `cabal install haskell-language-server`, is not recommended for most people.
 Said command builds the `haskell-language-server` binary and installs it in the default Cabal binaries folder,
 but the binary will only work with projects that use the same GHC version that built it.
+
+The package can be found here on Hackage: https://hackage.haskell.org/package/haskell-language-server
 
 ## Configuring `haskell-language-server`
 
@@ -635,6 +645,13 @@ This returns an error in HLS if 'tasty-discover' is not in the path: `could not 
 These are known to be somewhat buggy at the moment: https://github.com/haskell/haskell-language-server/issues/478.
 This issue should be fixed in Stack versions >= 2.5.
 
+#### Problems with dynamic linking
+
+As haskell-language-server prebuilt binaries are statically linked, they don't play well with projects using dynamic linking.
+An usual symptom is the presence of errors containing `unknown symbol` and it is typical in arch linux, where a dynamically linked version of ghc is used. 
+
+The workaround is to use a version of haskell-language-server compiled from source with `-dynamic` enabled`. See more details [here](https://github.com/haskell/haskell-language-server/issues/1160#issuecomment-756566273).
+
 ### Troubleshooting the server
 
 #### Diagnostic mode
@@ -669,7 +686,7 @@ it to look for the right executable.
 
 :heart: The Haskell tooling dream is near, we need your help! :heart:
 
-- Join [our IRC channel](https://webchat.freenode.net/?channels=haskell-ide-engine) at `#haskell-ide-engine` on `freenode`.
+- Join [our IRC channel](https://webchat.freenode.net/?channels=haskell-language-server) at `#haskell-language-server` on `freenode`.
 - Fork this repo and [ghcide](https://github.com/haskell/ghcide) and hack as much as you can.
 
 ### Style guidelines

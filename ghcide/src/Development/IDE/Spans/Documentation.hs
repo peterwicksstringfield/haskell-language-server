@@ -35,7 +35,7 @@ import           SrcLoc (RealLocated)
 import           GhcMonad
 import           Packages
 import           Name
-import           Language.Haskell.LSP.Types (getUri, filePathToUri)
+import           Language.LSP.Types (getUri, filePathToUri)
 import           TcRnTypes
 import           ExtractDocs
 import           NameEnv
@@ -44,7 +44,7 @@ import HscTypes (HscEnv(hsc_dflags))
 mkDocMap
   :: HscEnv
   -> [ParsedModule]
-  -> RefMap
+  -> RefMap a
   -> TcGblEnv
   -> IO DocAndKindMap
 mkDocMap env sources rm this_mod =
@@ -99,8 +99,8 @@ getDocumentationsTryGhc env mod sources names = do
             src <- toFileUriText $ lookupSrcHtmlForModule df mod
             return (doc, src)
           Nothing -> pure (Nothing, Nothing)
-      let docUri = (<> "#" <> selector <> showName name) <$> docFu
-          srcUri = (<> "#" <> showName name) <$> srcFu
+      let docUri = (<> "#" <> selector <> showNameWithoutUniques name) <$> docFu
+          srcUri = (<> "#" <> showNameWithoutUniques name) <$> srcFu
           selector
             | isValName name = "v:"
             | otherwise = "t:"
@@ -212,8 +212,8 @@ lookupHtmlForModule mkDocPath df m = do
     go pkgDocDir = map (mkDocPath pkgDocDir) mns
     ui = moduleUnitId m
     -- try to locate html file from most to least specific name e.g.
-    --  first Language.Haskell.LSP.Types.Uri.html and Language-Haskell-LSP-Types-Uri.html
-    --  then Language.Haskell.LSP.Types.html and Language-Haskell-LSP-Types.html etc.
+    --  first Language.LSP.Types.Uri.html and Language-Haskell-LSP-Types-Uri.html
+    --  then Language.LSP.Types.html and Language-Haskell-LSP-Types.html etc.
     mns = do
       chunks <- (reverse . drop1 . inits . splitOn ".") $ (moduleNameString . moduleName) m
       -- The file might use "." or "-" as separator

@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveAnyClass      #-}
 {-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE GADTs               #-}
 {-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE NumDecimals         #-}
 {-# LANGUAGE OverloadedStrings   #-}
@@ -16,9 +17,11 @@ module Ide.Plugin.Tactic
 
 import           Control.Arrow
 import           Control.Monad
+import           Control.Monad.Error.Class (MonadError(throwError))
 import           Control.Monad.Trans
 import           Control.Monad.Trans.Maybe
 import           Data.Aeson
+import           Data.Bool (bool)
 import           Data.Coerce
 import           Data.Functor ((<&>))
 import           Data.Generics.Aliases (mkQ)
@@ -38,6 +41,8 @@ import           Development.IDE.Core.Service (runAction)
 import           Development.IDE.Core.Shake (useWithStale, IdeState (..))
 import           Development.IDE.GHC.Compat
 import           Development.IDE.GHC.Error (realSrcSpanToRange)
+import           Development.IDE.GHC.ExactPrint (graft, transform, useAnnotatedSource, maybeParensAST)
+import           Development.IDE.GHC.ExactPrint (graftWithoutParentheses)
 import           Development.IDE.Spans.LocalBindings (getDefiningBindings)
 import           Development.Shake (Action)
 import           DynFlags (xopt)
@@ -53,11 +58,11 @@ import           Ide.Plugin.Tactic.Tactics
 import           Ide.Plugin.Tactic.TestTypes
 import           Ide.Plugin.Tactic.Types
 import           Ide.PluginUtils
-import Development.IDE.GHC.ExactPrint (graft, transform, useAnnotatedSource)
 import           Ide.Types
-import           Language.Haskell.LSP.Core (clientCapabilities)
-import           Language.Haskell.LSP.Types
+import           Language.LSP.Server
+import           Language.LSP.Types
 import           OccName
+import           Refinery.Tactic (goal)
 import           SrcLoc (containsSpan)
 import           System.Timeout
 import           TcRnTypes (tcg_binds)
@@ -72,7 +77,7 @@ descriptor plId = (defaultPluginDescriptor plId)
               (tacticDesc $ tcCommandName tc)
               (tacticCmd $ commandTactic tc))
             (enumerate :: [TacticCommand])
-    , pluginCodeActionProvider = Just codeActionProvider
+    , pluginHandlers = mkPluginHandler STextDocumentCodeAction codeActionProvider
     }
 
 tacticDesc :: T.Text -> T.Text
@@ -81,7 +86,7 @@ tacticDesc name = "fill the hole using the " <> name <> " tactic"
 ------------------------------------------------------------------------------
 -- | A 'TacticProvider' is a way of giving context-sensitive actions to the LS
 -- UI.
-type TacticProvider = DynFlags -> PluginId -> Uri -> Range -> Judgement -> IO [CAResult]
+type TacticProvider = DynFlags -> PluginId -> Uri -> Range -> Judgement -> IO [Command |? CodeAction]
 
 
 ------------------------------------------------------------------------------
@@ -124,10 +129,22 @@ commandProvider HomomorphismLambdaCase =
 commandTactic :: TacticCommand -> OccName -> TacticsM ()
 commandTactic Auto         = const auto
 commandTactic Intros       = const intros
-commandTactic Destruct     = destruct
-commandTactic Homomorphism = homo
+commandTactic Destruct     = useNameFromHypothesis destruct
+commandTactic Homomorphism = useNameFromHypothesis homo
 commandTactic DestructLambdaCase     = const destructLambdaCase
 commandTactic HomomorphismLambdaCase = const homoLambdaCase
+
+
+------------------------------------------------------------------------------
+-- | Lift a function over 'HyInfo's to one that takes an 'OccName' and tries to
+-- look it up in the hypothesis.
+useNameFromHypothesis :: (HyInfo CType -> TacticsM a) -> OccName -> TacticsM a
+useNameFromHypothesis f name = do
+  hy <- jHypothesis <$> goal
+  case M.lookup name $ hyByName hy of
+    Just hi -> f hi
+    Nothing -> throwError $ NotInScope name
+
 
 
 ------------------------------------------------------------------------------
@@ -150,10 +167,10 @@ runIde :: IdeState -> Action a -> IO a
 runIde state = runAction "tactic" state
 
 
-codeActionProvider :: CodeActionProvider IdeState
-codeActionProvider _conf state plId (TextDocumentIdentifier uri) range _ctx
+codeActionProvider :: PluginMethodHandler IdeState TextDocumentCodeAction
+codeActionProvider state plId (CodeActionParams _ _ (TextDocumentIdentifier uri) range _ctx)
   | Just nfp <- uriToNormalizedFilePath $ toNormalizedUri uri =
-      fromMaybeT (Right $ List []) $ do
+      liftIO $ fromMaybeT (Right $ List []) $ do
         (_, jdg, _, dflags) <- judgementForHole state nfp range
         actions <- lift $
           -- This foldMap is over the function monoid.
@@ -164,11 +181,11 @@ codeActionProvider _conf state plId (TextDocumentIdentifier uri) range _ctx
             range
             jdg
         pure $ Right $ List actions
-codeActionProvider _ _ _ _ _ _ = pure $ Right $ codeActions []
+codeActionProvider _ _ _ = pure $ Right $ codeActions []
 
 
-codeActions :: [CodeAction] -> List CAResult
-codeActions = List . fmap CACodeAction
+codeActions :: [CodeAction] -> List (Command |? CodeAction)
+codeActions = List . fmap InR
 
 
 ------------------------------------------------------------------------------
@@ -178,11 +195,11 @@ provide :: TacticCommand -> T.Text -> TacticProvider
 provide tc name _ plId uri range _ = do
   let title = tacticTitle tc name
       params = TacticParams { file = uri , range = range , var_name = name }
-  cmd <- mkLspCommand plId (tcCommandId tc) title (Just [toJSON params])
+      cmd = mkLspCommand plId (tcCommandId tc) title (Just [toJSON params])
   pure
     $ pure
-    $ CACodeAction
-    $ CodeAction title (Just CodeActionQuickFix) Nothing Nothing
+    $ InR
+    $ CodeAction title (Just CodeActionQuickFix) Nothing Nothing Nothing Nothing
     $ Just cmd
 
 
@@ -216,10 +233,11 @@ filterBindingType
 filterBindingType p tp dflags plId uri range jdg =
   let hy = jHypothesis jdg
       g  = jGoal jdg
-   in fmap join $ for (M.toList hy) $ \(occ, hi_type -> CType ty) ->
-        if p (unCType g) ty
-          then tp occ ty dflags plId uri range jdg
-          else pure []
+   in fmap join $ for (unHypothesis hy) $ \hi ->
+        let ty = unCType $ hi_type hi
+         in if $ p (unCType g) ty
+              then tp (hi_name hi) ty dflags plId uri range jdg
+              else pure []
 
 
 data TacticParams = TacticParams
@@ -249,50 +267,56 @@ judgementForHole state nfp range = do
   ((modsum,_), _) <- MaybeT $ runIde state $ useWithStale GetModSummaryWithoutTimestamps nfp
   let dflags = ms_hspp_opts modsum
 
-  (rss, goal) <- liftMaybe $ join $ listToMaybe $ M.elems $ flip M.mapWithKey (getAsts $ hieAst asts) $ \fs ast ->
-      case selectSmallestContaining (rangeToRealSrcSpan (FastString.unpackFS fs) range') ast of
-        Nothing -> Nothing
-        Just ast' -> do
-          let info = nodeInfo ast'
-          ty <- listToMaybe $ nodeType info
-          guard $ ("HsUnboundVar","HsExpr") `S.member` nodeAnnotations info
-          pure (nodeSpan ast', ty)
+  case asts of
+    (HAR _ hf _ _ kind) -> do
+      (rss, goal) <- liftMaybe $ join $ listToMaybe $ M.elems $ flip M.mapWithKey (getAsts hf) $ \fs ast ->
+          case selectSmallestContaining (rangeToRealSrcSpan (FastString.unpackFS fs) range') ast of
+            Nothing -> Nothing
+            Just ast' -> do
+              let info = nodeInfo ast'
+              ty <- listToMaybe $ nodeType info
+              guard $ ("HsUnboundVar","HsExpr") `S.member` nodeAnnotations info
+              pure (nodeSpan ast', ty)
 
-  resulting_range <- liftMaybe $ toCurrentRange amapping $ realSrcSpanToRange rss
-  (tcmod, _) <- MaybeT $ runIde state $ useWithStale TypeCheck nfp
-  let tcg  = tmrTypechecked tcmod
-      tcs = tcg_binds tcg
-      ctx = mkContext
-              (mapMaybe (sequenceA . (occName *** coerce))
-                $ getDefiningBindings binds rss)
-              tcg
-      top_provs = getRhsPosVals rss tcs
-      local_hy = spliceProvenance top_provs
-               $ hypothesisFromBindings rss binds
-      cls_hy = contextMethodHypothesis ctx
-  pure ( resulting_range
-       , mkFirstJudgement
-           (local_hy <> cls_hy)
-           (isRhsHole rss tcs)
-           goal
-       , ctx
-       , dflags
-       )
-
+      resulting_range <- liftMaybe $ toCurrentRange amapping $ realSrcSpanToRange rss
+      (tcmod, _) <- MaybeT $ runIde state $ useWithStale TypeCheck nfp
+      let tcg  = tmrTypechecked tcmod
+          tcs = tcg_binds tcg
+          ctx = mkContext
+                  (mapMaybe (sequenceA . (occName *** coerce))
+                    $ getDefiningBindings binds rss)
+                  tcg
+          top_provs = getRhsPosVals rss tcs
+          local_hy = spliceProvenance top_provs
+                   $ hypothesisFromBindings rss binds
+          cls_hy = contextMethodHypothesis ctx
+      case kind of
+        HieFromDisk hf' ->
+          fail "Need a fresh hie file"
+        HieFresh ->
+          pure ( resulting_range
+               , mkFirstJudgement
+                   (local_hy <> cls_hy)
+                   (isRhsHole rss tcs)
+                   goal
+               , ctx
+               , dflags
+               )
 
 spliceProvenance
     :: Map OccName Provenance
-    -> Map OccName (HyInfo a)
-    -> Map OccName (HyInfo a)
-spliceProvenance provs =
-  M.mapWithKey $ \name hi ->
-    overProvenance (maybe id const $ M.lookup name provs) hi
+    -> Hypothesis a
+    -> Hypothesis a
+spliceProvenance provs x =
+  Hypothesis $ flip fmap (unHypothesis x) $ \hi ->
+    overProvenance (maybe id const $ M.lookup (hi_name hi) provs) hi
 
 
 tacticCmd :: (OccName -> TacticsM ()) -> CommandFunction IdeState TacticParams
-tacticCmd tac lf state (TacticParams uri range var_name)
-  | Just nfp <- uriToNormalizedFilePath $ toNormalizedUri uri =
-      fromMaybeT (Right Null, Nothing) $ do
+tacticCmd tac state (TacticParams uri range var_name)
+  | Just nfp <- uriToNormalizedFilePath $ toNormalizedUri uri = do
+      clientCapabilities <- getClientCapabilities
+      res <- liftIO $ fromMaybeT (Right Nothing) $ do
         (range', jdg, ctx, dflags) <- judgementForHole state nfp range
         let span = rangeToRealSrcSpan (fromNormalizedFilePath nfp) range'
         pm <- MaybeT $ useAnnotatedSource "tacticsCmd" state nfp
@@ -302,25 +326,31 @@ tacticCmd tac lf state (TacticParams uri range var_name)
                 $ mkVarOcc
                 $ T.unpack var_name of
             Left err ->
-              pure $ (, Nothing)
-                $ Left
-                $ ResponseError InvalidRequest (T.pack $ show err) Nothing
+              pure $ Left
+                   $ ResponseError InvalidRequest (T.pack $ show err) Nothing
             Right rtr -> do
               traceMX "solns" $ rtr_other_solns rtr
-              let g = graft (RealSrcSpan span) $ rtr_extract rtr
-                  response = transform dflags (clientCapabilities lf) uri g pm
+              traceMX "simplified" $ rtr_extract rtr
+              let g = graftWithoutParentheses (RealSrcSpan span)
+                      -- Parenthesize the extract iff we're not in a top level hole
+                    $ bool maybeParensAST id (_jIsTopHole jdg)
+                    $ rtr_extract rtr
+                  response = transform dflags clientCapabilities uri g pm
               pure $ case response of
-                Right res -> (Right Null , Just (WorkspaceApplyEdit, ApplyWorkspaceEditParams res))
-                Left err -> (Left $ ResponseError InternalError (T.pack err) Nothing, Nothing)
+                Right res -> Right $ Just res
+                Left err -> Left $ ResponseError InternalError (T.pack err) Nothing
         pure $ case x of
           Just y -> y
-          Nothing -> (, Nothing)
-                   $ Left
+          Nothing -> Left
                    $ ResponseError InvalidRequest "timed out" Nothing
-tacticCmd _ _ _ _ =
-  pure ( Left $ ResponseError InvalidRequest (T.pack "Bad URI") Nothing
-       , Nothing
-       )
+      case res of
+        Left err -> pure $ Left err
+        Right medit -> do
+          forM_ medit $ \edit ->
+            sendRequest SWorkspaceApplyEdit (ApplyWorkspaceEditParams Nothing edit) (\_ -> pure ())
+          pure $ Right Null
+tacticCmd _ _ _ =
+  pure $ Left $ ResponseError InvalidRequest (T.pack "Bad URI") Nothing
 
 
 fromMaybeT :: Functor m => a -> MaybeT m a -> m a

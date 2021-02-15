@@ -1,7 +1,9 @@
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE ImpredicativeTypes #-}
+{-# OPTIONS_GHC -Wno-deprecations -Wno-unticked-promoted-constructors #-}
 
 module Experiments
 ( Bench(..)
@@ -20,19 +22,19 @@ module Experiments
 , exampleToOptions
 ) where
 import Control.Applicative.Combinators (skipManyTill)
-import Control.Exception.Safe
+import Control.Exception.Safe (IOException, handleAny, try)
 import Control.Monad.Extra
 import Control.Monad.IO.Class
-import Data.Aeson (Value(Null))
+import Data.Aeson (Value(Null), toJSON)
 import Data.List
 import Data.Maybe
 import qualified Data.Text as T
 import Data.Version
 import Development.IDE.Plugin.Test
 import Experiments.Types
-import Language.Haskell.LSP.Test
-import Language.Haskell.LSP.Types
-import Language.Haskell.LSP.Types.Capabilities
+import Language.LSP.Test
+import Language.LSP.Types
+import Language.LSP.Types.Capabilities
 import Numeric.Natural
 import Options.Applicative
 import System.Directory
@@ -41,6 +43,7 @@ import System.FilePath ((</>), (<.>))
 import System.Process
 import System.Time.Extra
 import Text.ParserCombinators.ReadP (readP_to_S)
+import Development.Shake (cmd_, CmdOption (Cwd, FileStdout))
 
 charEdit :: Position -> TextDocumentContentChangeEvent
 charEdit p =
@@ -62,44 +65,44 @@ allWithIdentifierPos f docs = allM f (filter (isJust . identifierP) docs)
 experiments :: [Bench]
 experiments =
     [ ---------------------------------------------------------------------------------------
-      bench "hover" 10 $ allWithIdentifierPos $ \DocumentPositions{..} ->
+      bench "hover" $ allWithIdentifierPos $ \DocumentPositions{..} ->
         isJust <$> getHover doc (fromJust identifierP),
       ---------------------------------------------------------------------------------------
-      bench "edit" 10 $ \docs -> do
+      bench "edit" $ \docs -> do
         forM_ docs $ \DocumentPositions{..} ->
           changeDoc doc [charEdit stringLiteralP]
         waitForProgressDone -- TODO check that this waits for all of them
         return True,
       ---------------------------------------------------------------------------------------
-      bench "hover after edit" 10 $ \docs -> do
+      bench "hover after edit" $ \docs -> do
         forM_ docs $ \DocumentPositions{..} ->
           changeDoc doc [charEdit stringLiteralP]
         flip allWithIdentifierPos docs $ \DocumentPositions{..} ->
           isJust <$> getHover doc (fromJust identifierP),
       ---------------------------------------------------------------------------------------
-      bench "getDefinition" 10 $ allWithIdentifierPos $ \DocumentPositions{..} ->
-        not . null <$> getDefinitions doc (fromJust identifierP),
+      bench "getDefinition" $ allWithIdentifierPos $ \DocumentPositions{..} ->
+        either (not . null) (not . null) . toEither <$> getDefinitions doc (fromJust identifierP),
       ---------------------------------------------------------------------------------------
-      bench "getDefinition after edit" 10 $ \docs -> do
+      bench "getDefinition after edit" $ \docs -> do
           forM_ docs $ \DocumentPositions{..} ->
             changeDoc doc [charEdit stringLiteralP]
           flip allWithIdentifierPos docs $ \DocumentPositions{..} ->
-            not . null <$> getDefinitions doc (fromJust identifierP),
+            either (not . null) (not . null) . toEither <$> getDefinitions doc (fromJust identifierP),
       ---------------------------------------------------------------------------------------
-      bench "documentSymbols" 100 $ allM $ \DocumentPositions{..} -> do
+      bench "documentSymbols" $ allM $ \DocumentPositions{..} -> do
         fmap (either (not . null) (not . null)) . getDocumentSymbols $ doc,
       ---------------------------------------------------------------------------------------
-      bench "documentSymbols after edit" 100 $ \docs -> do
+      bench "documentSymbols after edit" $ \docs -> do
         forM_ docs $ \DocumentPositions{..} ->
           changeDoc doc [charEdit stringLiteralP]
         flip allM docs $ \DocumentPositions{..} ->
           either (not . null) (not . null) <$> getDocumentSymbols doc,
       ---------------------------------------------------------------------------------------
-      bench "completions" 10 $ \docs -> do
+      bench "completions" $ \docs -> do
         flip allWithIdentifierPos docs $ \DocumentPositions{..} ->
           not . null <$> getCompletions doc (fromJust identifierP),
       ---------------------------------------------------------------------------------------
-      bench "completions after edit" 10 $ \docs -> do
+      bench "completions after edit" $ \docs -> do
         forM_ docs $ \DocumentPositions{..} ->
           changeDoc doc [charEdit stringLiteralP]
         flip allWithIdentifierPos docs $ \DocumentPositions{..} ->
@@ -107,7 +110,6 @@ experiments =
       ---------------------------------------------------------------------------------------
       benchWithSetup
         "code actions"
-        10
         ( \docs -> do
             unless (any (isJust . identifierP) docs) $
                 error "None of the example modules is suitable for this experiment"
@@ -122,7 +124,6 @@ experiments =
       ---------------------------------------------------------------------------------------
       benchWithSetup
         "code actions after edit"
-        10
         ( \docs -> do
             unless (any (isJust . identifierP) docs) $
                 error "None of the example modules is suitable for this experiment"
@@ -136,6 +137,37 @@ experiments =
             not . null . catMaybes <$> forM docs (\DocumentPositions{..} -> do
               forM identifierP $ \p ->
                 getCodeActions doc (Range p p))
+        ),
+      ---------------------------------------------------------------------------------------
+      benchWithSetup
+        "code actions after cradle edit"
+        ( \docs -> do
+            unless (any (isJust . identifierP) docs) $
+                error "None of the example modules is suitable for this experiment"
+            forM_ docs $ \DocumentPositions{..} ->
+                forM_ identifierP $ \p -> changeDoc doc [charEdit p]
+        )
+        ( \docs -> do
+            Just hieYaml <- uriToFilePath <$> getDocUri "hie.yaml"
+            liftIO $ appendFile hieYaml "##\n"
+            sendNotification SWorkspaceDidChangeWatchedFiles $ DidChangeWatchedFilesParams $
+                List [ FileEvent (filePathToUri "hie.yaml") FcChanged ]
+            forM_ docs $ \DocumentPositions{..} ->
+              changeDoc doc [charEdit stringLiteralP]
+            waitForProgressDone
+            not . null . catMaybes <$> forM docs (\DocumentPositions{..} -> do
+              forM identifierP $ \p ->
+                getCodeActions doc (Range p p))
+        ),
+      ---------------------------------------------------------------------------------------
+      bench
+        "hover after cradle edit"
+        (\docs -> do
+            Just hieYaml <- uriToFilePath <$> getDocUri "hie.yaml"
+            liftIO $ appendFile hieYaml "##\n"
+            sendNotification SWorkspaceDidChangeWatchedFiles $ DidChangeWatchedFilesParams $
+                List [ FileEvent (filePathToUri "hie.yaml") FcChanged ]
+            flip allWithIdentifierPos docs $ \DocumentPositions{..} -> isJust <$> getHover doc (fromJust identifierP)
         )
     ]
 
@@ -208,21 +240,20 @@ select Bench {name, enabled} =
 
 benchWithSetup ::
   String ->
-  Natural ->
   ([DocumentPositions] -> Session ()) ->
   Experiment ->
   Bench
-benchWithSetup name samples benchSetup experiment = Bench {..}
+benchWithSetup name benchSetup experiment = Bench {..}
   where
     enabled = True
+    samples = 100
 
-bench :: String -> Natural -> Experiment -> Bench
-bench name defSamples =
-  benchWithSetup name defSamples (const $ pure ())
+bench :: String -> Experiment -> Bench
+bench name = benchWithSetup name (const $ pure ())
 
 runBenchmarksFun :: HasConfig => FilePath -> [Bench] -> IO ()
 runBenchmarksFun dir allBenchmarks = do
-  let benchmarks = [ b{samples = fromMaybe (samples b) (repetitions ?config) }
+  let benchmarks = [ b{samples = fromMaybe 100 (repetitions ?config) }
                    | b <- allBenchmarks
                    , select b ]
 
@@ -324,9 +355,17 @@ data BenchRun = BenchRun
 badRun :: BenchRun
 badRun = BenchRun 0 0 0 0 0 False
 
+-- | Wait for all progress to be done
+-- Needs at least one progress done notification to return
 waitForProgressDone :: Session ()
-waitForProgressDone =
-      void(skipManyTill anyMessage message :: Session WorkDoneProgressEndNotification)
+waitForProgressDone = loop
+  where
+    loop = do
+      ~() <- skipManyTill anyMessage $ satisfyMaybe $ \case
+        FromServerMess SProgress (NotificationMessage _ _ (ProgressParams _ (End _))) -> Just ()
+        _ -> Nothing
+      done <- null <$> getIncompleteProgressSessions
+      unless done loop
 
 runBench ::
   (?config :: Config) =>
@@ -358,8 +397,9 @@ runBench runSess b = handleAny (\e -> print e >> return badRun)
             else do
                 output (showDuration t)
                 -- Wait for the delayed actions to finish
-                waitId <- sendRequest (CustomClientMethod "test") WaitForShakeQueue
-                (td, resp) <- duration $ skipManyTill anyMessage $ responseForId waitId
+                let m = SCustomMethod "test"
+                waitId <- sendRequest m (toJSON WaitForShakeQueue)
+                (td, resp) <- duration $ skipManyTill anyMessage $ responseForId m waitId
                 case resp of
                     ResponseMessage{_result=Right Null} -> do
                       loop (userWaits+t) (delayedWork+td) (n -1)
@@ -389,19 +429,24 @@ setup :: HasConfig => IO SetupResult
 setup = do
 --   when alreadyExists $ removeDirectoryRecursive examplesPath
   benchDir <- case example ?config of
-      UsePackage{..} -> return examplePath
+      UsePackage{..} -> do
+          let hieYamlPath = examplePath </> "hie.yaml"
+          alreadyExists <- doesFileExist hieYamlPath
+          unless alreadyExists $
+                cmd_ (Cwd examplePath) (FileStdout hieYamlPath) ("gen-hie"::String)
+          return examplePath
       GetPackage{..} -> do
         let path = examplesPath </> package
             package = exampleName <> "-" <> showVersion exampleVersion
+            hieYamlPath = path </> "hie.yaml"
         alreadySetup <- doesDirectoryExist path
         unless alreadySetup $
           case buildTool ?config of
             Cabal -> do
                 let cabalVerbosity = "-v" ++ show (fromEnum (verbose ?config))
                 callCommandLogging $ "cabal get " <> cabalVerbosity <> " " <> package <> " -d " <> examplesPath
-                writeFile
-                    (path </> "hie.yaml")
-                    ("cradle: {cabal: {component: " <> exampleName <> "}}")
+                let hieYamlPath = path </> "hie.yaml"
+                cmd_ (Cwd path) (FileStdout hieYamlPath) ("gen-hie"::String)
                 -- Need this in case there is a parent cabal.project somewhere
                 writeFile
                     (path </> "cabal.project")
@@ -430,9 +475,7 @@ setup = do
                             ]
                         )
 
-                writeFile
-                    (path </> "hie.yaml")
-                    ("cradle: {stack: {component: " <> show (exampleName <> ":lib") <> "}}")
+                cmd_ (Cwd path) (FileStdout hieYamlPath) ("gen-hie"::String) ["--stack"::String]
         return path
 
   whenJust (shakeProfiling ?config) $ createDirectoryIfMissing True
@@ -464,22 +507,21 @@ setupDocumentContents config =
 
         -- Find an identifier defined in another file in this project
         symbols <- getDocumentSymbols doc
-        case symbols of
-            Left [DocumentSymbol{_children = Just (List symbols)}] -> do
-                let endOfImports = case symbols of
-                        DocumentSymbol{_kind = SkModule, _name = "imports", _range } : _ ->
-                            Position (succ $ _line $ _end _range) 4
-                        DocumentSymbol{_range} : _ -> _start _range
-                        [] -> error "Module has no symbols"
-                contents <- documentContents doc
+        let endOfImports = case symbols of
+                Left symbols | Just x <- findEndOfImports symbols -> x
+                _ -> error $ "symbols: " <> show symbols
+        contents <- documentContents doc
+        identifierP <- searchSymbol doc contents endOfImports
+        return $ DocumentPositions{..}
 
-                identifierP <- searchSymbol doc contents endOfImports
-
-                return $ DocumentPositions{..}
-            other ->
-                error $ "symbols: " <> show other
-
-
+findEndOfImports :: [DocumentSymbol] -> Maybe Position
+findEndOfImports (DocumentSymbol{_kind = SkModule, _name = "imports", _range} : _) =
+    Just $ Position (succ $ _line $ _end _range) 4
+findEndOfImports [DocumentSymbol{_kind = SkFile, _children = Just (List cc)}] =
+    findEndOfImports cc
+findEndOfImports (DocumentSymbol{_range} : _) =
+    Just $ _start _range
+findEndOfImports _ = Nothing
 
 --------------------------------------------------------------------------------------------
 
@@ -525,7 +567,7 @@ searchSymbol doc@TextDocumentIdentifier{_uri} fileContents pos = do
       checkDefinitions pos = do
         defs <- getDefinitions doc pos
         case defs of
-            [Location uri _] -> return $ uri /= _uri
+            (InL [Location uri _]) -> return $ uri /= _uri
             _ -> return False
       checkCompletions pos =
         not . null <$> getCompletions doc pos

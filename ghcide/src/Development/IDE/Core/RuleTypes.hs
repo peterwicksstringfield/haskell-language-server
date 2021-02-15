@@ -6,6 +6,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GADTs #-}
 
 -- | A Shake implementation of the compiler service, built
 --   using the "Shaker" abstraction layer for in-memory use.
@@ -21,22 +22,21 @@ import Data.Binary
 import           Development.IDE.Import.DependencyInformation
 import Development.IDE.GHC.Compat hiding (HieFileResult)
 import Development.IDE.GHC.Util
+import Development.IDE.Types.HscEnvEq (HscEnvEq)
 import Development.IDE.Types.KnownTargets
 import           Data.Hashable
 import           Data.Typeable
-import qualified Data.Set as S
 import qualified Data.Map as M
 import           Development.Shake
 import           GHC.Generics                             (Generic)
 
-import Module (InstalledUnitId)
 import HscTypes (ModGuts, hm_iface, HomeModInfo, hm_linkable)
 
 import           Development.IDE.Spans.Common
 import           Development.IDE.Spans.LocalBindings
 import           Development.IDE.Import.FindImports (ArtifactsLocation)
 import Data.ByteString (ByteString)
-import Language.Haskell.LSP.Types (NormalizedFilePath)
+import Language.LSP.Types (NormalizedFilePath)
 import TcRnMonad (TcGblEnv)
 import qualified Data.ByteString.Char8 as BS
 import Development.IDE.Types.Options (IdeGhcSession)
@@ -170,17 +170,29 @@ instance Show HiFileResult where
 
 -- | Save the uncompressed AST here, we compress it just before writing to disk
 data HieAstResult
-  = HAR
+  = forall a. HAR
   { hieModule :: Module
-  , hieAst :: !(HieASTs Type)
-  , refMap :: RefMap
+  , hieAst :: !(HieASTs a)
+  , refMap :: RefMap a
   -- ^ Lazy because its value only depends on the hieAst, which is bundled in this type
   -- Lazyness can't cause leaks here because the lifetime of `refMap` will be the same
   -- as that of `hieAst`
+  , typeRefs :: M.Map Name [RealSrcSpan]
+  -- ^ type references in this file
+  , hieKind :: !(HieKind a)
+  -- ^ Is this hie file loaded from the disk, or freshly computed?
   }
 
+data HieKind a where
+  HieFromDisk :: !HieFile -> HieKind TypeIndex
+  HieFresh :: HieKind Type
+
+instance NFData (HieKind a) where
+    rnf (HieFromDisk hf) = rnf hf
+    rnf HieFresh = ()
+
 instance NFData HieAstResult where
-    rnf (HAR m hf _rm) = rnf m `seq` rwhnf hf
+    rnf (HAR m hf _rm _tr kind) = rnf m `seq` rwhnf hf `seq` rnf kind
 
 instance Show HieAstResult where
     show = show . hieModule
@@ -209,9 +221,8 @@ type instance RuleResult GhcSession = HscEnvEq
 -- | A GHC session preloaded with all the dependencies
 type instance RuleResult GhcSessionDeps = HscEnvEq
 
--- | Resolve the imports in a module to the file path of a module
--- in the same package or the package id of another package.
-type instance RuleResult GetLocatedImports = ([(Located ModuleName, Maybe ArtifactsLocation)], S.Set InstalledUnitId)
+-- | Resolve the imports in a module to the file path of a module in the same package
+type instance RuleResult GetLocatedImports = [(Located ModuleName, Maybe ArtifactsLocation)]
 
 -- | This rule is used to report import cycles. It depends on GetDependencyInformation.
 -- We cannot report the cycles directly from GetDependencyInformation since
@@ -221,6 +232,10 @@ type instance RuleResult ReportImportCycles = ()
 -- | Read the module interface file from disk. Throws an error for VFS files.
 --   This is an internal rule, use 'GetModIface' instead.
 type instance RuleResult GetModIfaceFromDisk = HiFileResult
+
+-- | GetModIfaceFromDisk and index the `.hie` file into the database.
+--   This is an internal rule, use 'GetModIface' instead.
+type instance RuleResult GetModIfaceFromDiskAndIndex = HiFileResult
 
 -- | Get a module interface details, either from an interface file or a typechecked module
 type instance RuleResult GetModIface = HiFileResult
@@ -278,7 +293,10 @@ instance NFData   GetFileContents
 instance Binary   GetFileContents
 
 
-data FileOfInterestStatus = OnDisk | Modified
+data FileOfInterestStatus
+  = OnDisk
+  | Modified { firstOpen :: !Bool -- ^ was this file just opened
+             }
   deriving (Eq, Show, Typeable, Generic)
 instance Hashable FileOfInterestStatus
 instance NFData   FileOfInterestStatus
@@ -391,6 +409,12 @@ data GetModIfaceFromDisk = GetModIfaceFromDisk
 instance Hashable GetModIfaceFromDisk
 instance NFData   GetModIfaceFromDisk
 instance Binary   GetModIfaceFromDisk
+
+data GetModIfaceFromDiskAndIndex = GetModIfaceFromDiskAndIndex
+    deriving (Eq, Show, Typeable, Generic)
+instance Hashable GetModIfaceFromDiskAndIndex
+instance NFData   GetModIfaceFromDiskAndIndex
+instance Binary   GetModIfaceFromDiskAndIndex
 
 data GetModIface = GetModIface
     deriving (Eq, Show, Typeable, Generic)

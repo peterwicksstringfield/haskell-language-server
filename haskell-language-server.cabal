@@ -1,7 +1,7 @@
 cabal-version:      2.2
 category:           Development
 name:               haskell-language-server
-version:            0.8.0.0
+version:            0.9.0.0
 synopsis:           LSP server for GHC
 description:
   Please see the README on GitHub at <https://github.com/haskell/haskell-language-server#readme>
@@ -13,9 +13,8 @@ maintainer:         alan.zimm@gmail.com
 copyright:          The Haskell IDE Team
 license:            Apache-2.0
 license-file:       LICENSE
-category:           Development
 build-type:         Simple
-tested-with:        GHC == 8.6.4 || == 8.6.5 || == 8.8.2 || == 8.8.3 || == 8.8.4 || == 8.10.1 || == 8.10.2 || == 8.10.3
+tested-with:        GHC == 8.6.4 || == 8.6.5 || == 8.8.2 || == 8.8.3 || == 8.8.4 || == 8.10.2 || == 8.10.3 || == 8.10.4
 extra-source-files:
   README.md
   ChangeLog.md
@@ -58,26 +57,35 @@ library
   autogen-modules:  Paths_haskell_language_server
   hs-source-dirs:   src
   build-depends:
+    , async
+    , base16-bytestring
+    , bytestring
     , containers
+    , cryptohash-sha1
     , data-default
     , ghc
-    , ghcide                >=0.7
+    , ghcide                >=0.7.5
     , gitrev
-    , haskell-lsp           ^>=0.23
-    , hls-plugin-api        >=0.6
+    , lsp
+    , hls-plugin-api        >=0.7
+    , hie-bios
+    , hiedb
     , hslogger
     , optparse-applicative
     , optparse-simple
     , process
     , shake
+    , safe-exceptions
+    , sqlite-simple
     , unordered-containers
 
-  ghc-options:      -Wall -Wredundant-constraints -Wno-name-shadowing
+  ghc-options:      -Wall -Wredundant-constraints -Wno-name-shadowing -Wno-unticked-promoted-constructors
 
   if flag(pedantic)
     ghc-options: -Werror
 
   default-language: Haskell2010
+  default-extensions: DataKinds, TypeOperators
 
 -- Plugin flags are designed for 'cabal install haskell-language-server':
 -- - Packaged plugins should be manual:False
@@ -221,6 +229,7 @@ common moduleName
 common pragmas
   if flag(pragmas) || flag(all-plugins)
     hs-source-dirs: plugins/default/src
+    build-depends: fuzzy
     other-modules: Ide.Plugin.Pragmas
     cpp-options: -Dpragmas
 
@@ -298,21 +307,27 @@ executable haskell-language-server
     -- disable idle GC
     -- increase nursery size
     "-with-rtsopts=-I0 -A128M"
+    -Wno-unticked-promoted-constructors
   if flag(pedantic)
     ghc-options: -Werror
 
   build-depends:
     , aeson
+    , async
+    , base16-bytestring
     , binary
     , bytestring
     , containers
+    , cryptohash-sha1
     , deepseq
     , ghc
     , ghc-boot-th
     , ghcide
     , hashable
     , haskell-language-server
-    , haskell-lsp              ^>=0.23
+    , lsp
+    , hie-bios
+    , hiedb
     , lens
     , regex-tdfa
     , hslogger
@@ -323,6 +338,7 @@ executable haskell-language-server
     , regex-tdfa
     , safe-exceptions
     , shake                    >=0.17.5
+    , sqlite-simple
     , temporary
     , transformers
     , unordered-containers
@@ -330,6 +346,7 @@ executable haskell-language-server
 
   include-dirs:     include
   default-language: Haskell2010
+  default-extensions: DataKinds, TypeOperators
 
 executable haskell-language-server-wrapper
   import:           agpl, common-deps
@@ -372,14 +389,14 @@ common hls-test-utils
     , blaze-markup
     , containers
     , data-default
-    , haskell-lsp
+    , lsp
     , hie-bios
     , hls-plugin-api        >=0.6
     , hslogger
     , hspec
     , hspec-core
     , lens
-    , lsp-test              >=0.11.0.6
+    , lsp-test              == 0.13.0.0
     , stm
     , tasty-expected-failure
     , tasty-hunit
@@ -412,9 +429,11 @@ test-suite func-test
     , tasty-ant-xml           >=1.1.6
     , tasty-golden
     , tasty-rerun
+    , megaparsec
+    , deepseq
     , ghcide
 
-  hs-source-dirs:     test/functional plugins/hls-tactics-plugin/src plugins/hls-eval-plugin/test plugins/hls-splice-plugin/src
+  hs-source-dirs:     test/functional plugins/hls-tactics-plugin/src plugins/hls-eval-plugin/test plugins/hls-splice-plugin/src plugins/hls-eval-plugin/src
 
   main-is:            Main.hs
   other-modules:
@@ -443,9 +462,11 @@ test-suite func-test
     HaddockComments
     Ide.Plugin.Splice.Types
     Ide.Plugin.Tactic.TestTypes
+    Ide.Plugin.Eval.Types
 
+  default-extensions: OverloadedStrings
   ghc-options:
-    -Wall -Wno-name-shadowing -threaded -rtsopts -with-rtsopts=-N
+    -Wall -Wno-name-shadowing -threaded -rtsopts -with-rtsopts=-N -Wno-unticked-promoted-constructors
 
   if flag(pedantic)
     ghc-options: -Werror -Wredundant-constraints

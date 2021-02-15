@@ -5,7 +5,12 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE ImplicitParams  #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE CPP #-}
+{-# OPTIONS_GHC -Wno-deprecations -Wno-unticked-promoted-constructors #-}
 #include "ghc-api-version.h"
 
 module Main (main) where
@@ -14,8 +19,9 @@ import Control.Applicative.Combinators
 import Control.Exception (bracket_, catch)
 import qualified Control.Lens as Lens
 import Control.Monad
-import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (FromJSON, Value, toJSON)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Data.Aeson (toJSON,fromJSON)
+import qualified Data.Aeson as A
 import qualified Data.Binary as Binary
 import Data.Default
 import Data.Foldable
@@ -23,25 +29,36 @@ import Data.List.Extra
 import Data.Maybe
 import Data.Rope.UTF16 (Rope)
 import qualified Data.Rope.UTF16 as Rope
+import qualified Data.Set as Set
 import Development.IDE.Core.PositionMapping (fromCurrent, toCurrent, PositionResult(..), positionResultToMaybe)
 import Development.IDE.Core.Shake (Q(..))
 import Development.IDE.GHC.Util
 import qualified Data.Text as T
-import Data.Typeable
+import Development.IDE.Plugin.Completions.Types (extendImportCommandId)
+import Development.IDE.Plugin.TypeLenses (typeLensCommandId)
 import Development.IDE.Spans.Common
 import Development.IDE.Test
+    ( canonicalizeUri,
+      diagnostic,
+      expectCurrentDiagnostics,
+      expectDiagnostics,
+      expectDiagnosticsWithTags,
+      expectNoMoreDiagnostics,
+      flushMessages,
+      standardizeQuotes,
+      waitForAction,
+      Cursor, expectMessages )
 import Development.IDE.Test.Runfiles
 import qualified Development.IDE.Types.Diagnostics as Diagnostics
 import Development.IDE.Types.Location
 import Development.Shake (getDirectoryFilesIO)
 import Ide.Plugin.Config
 import qualified Experiments as Bench
-import Language.Haskell.LSP.Test
-import Language.Haskell.LSP.Messages
-import Language.Haskell.LSP.Types
-import Language.Haskell.LSP.Types.Capabilities
-import qualified Language.Haskell.LSP.Types.Lens as Lsp (diagnostics, params, message)
-import Language.Haskell.LSP.VFS (applyChange)
+import Language.LSP.Test
+import Language.LSP.Types hiding (mkRange)
+import Language.LSP.Types.Capabilities
+import qualified Language.LSP.Types.Lens as Lsp (diagnostics, params, message)
+import Language.LSP.VFS (applyChange)
 import Network.URI
 import System.Environment.Blank (unsetEnv, getEnv, setEnv)
 import System.FilePath
@@ -52,18 +69,30 @@ import System.Exit (ExitCode(ExitSuccess))
 import System.Process.Extra (readCreateProcessWithExitCode, CreateProcess(cwd), proc)
 import System.Info.Extra (isWindows)
 import Test.QuickCheck
-import Test.QuickCheck.Instances ()
+-- import Test.QuickCheck.Instances ()
 import Test.Tasty
 import Test.Tasty.ExpectedFailure
 import Test.Tasty.Ingredients.Rerun
 import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck
 import System.Time.Extra
-import Development.IDE.Plugin.CodeAction (typeSignatureCommandId, blockCommandId, matchRegExMultipleImports)
-import Development.IDE.Plugin.Test (WaitForIdeRuleResult(..), TestRequest(BlockSeconds,GetInterfaceFilesDir))
+import Development.IDE.Plugin.CodeAction (matchRegExMultipleImports)
+import Development.IDE.Plugin.Test (TestRequest (BlockSeconds, GetInterfaceFilesDir), WaitForIdeRuleResult (..), blockCommandId)
 import Control.Monad.Extra (whenJust)
-import qualified Language.Haskell.LSP.Types.Lens as L
+import qualified Language.LSP.Types.Lens as L
 import Control.Lens ((^.))
+import Data.Functor
+import Data.Tuple.Extra
+
+waitForProgressBegin :: Session ()
+waitForProgressBegin = skipManyTill anyMessage $ satisfyMaybe $ \case
+  FromServerMess SProgress (NotificationMessage _ _ (ProgressParams _ (Begin _))) -> Just ()
+  _ -> Nothing
+
+waitForProgressDone :: Session ()
+waitForProgressDone = skipManyTill anyMessage $ satisfyMaybe $ \case
+  FromServerMess SProgress (NotificationMessage _ _ (ProgressParams _ (End _))) -> Just ()
+  _ -> Nothing
 
 main :: IO ()
 main = do
@@ -71,10 +100,10 @@ main = do
   defaultMainWithRerun $ testGroup "ghcide"
     [ testSession "open close" $ do
         doc <- createDoc "Testing.hs" "haskell" ""
-        void (skipManyTill anyMessage message :: Session WorkDoneProgressCreateRequest)
-        void (skipManyTill anyMessage message :: Session WorkDoneProgressBeginNotification)
+        void (skipManyTill anyMessage $ message SWindowWorkDoneProgressCreate)
+        waitForProgressBegin
         closeDoc doc
-        void (skipManyTill anyMessage message :: Session WorkDoneProgressEndNotification)
+        waitForProgressDone
     , initializeResponseTests
     , completionTests
     , cppTests
@@ -103,6 +132,7 @@ main = do
     , asyncTests
     , clientSettingsTest
     , codeActionHelperFunctionTests
+    , referenceTests
     ]
 
 initializeResponseTests :: TestTree
@@ -113,66 +143,65 @@ initializeResponseTests = withResource acquire release tests where
   -- response. Currently the server advertises almost no capabilities
   -- at all, in some cases failing to announce capabilities that it
   -- actually does provide! Hopefully this will change ...
-  tests :: IO InitializeResponse -> TestTree
+  tests :: IO (ResponseMessage Initialize) -> TestTree
   tests getInitializeResponse =
     testGroup "initialize response capabilities"
     [ chk "   text doc sync"             _textDocumentSync  tds
-    , chk "   hover"                         _hoverProvider (Just True)
-    , chk "   completion"               _completionProvider (Just $ CompletionOptions (Just False) (Just ["."]) Nothing)
-    , chk "NO signature help"        _signatureHelpProvider  Nothing
-    , chk "   goto definition"          _definitionProvider (Just True)
-    , chk "   goto type definition" _typeDefinitionProvider (Just $ GotoOptionsStatic True)
+    , chk "   hover"                         _hoverProvider (Just $ InL True)
+    , chk "   completion"               _completionProvider (Just $ CompletionOptions Nothing (Just ["."]) Nothing (Just False))
+    , chk "NO signature help"        _signatureHelpProvider Nothing
+    , chk "   goto definition"          _definitionProvider (Just $ InL True)
+    , chk "   goto type definition" _typeDefinitionProvider (Just $ InL True)
     -- BUG in lsp-test, this test fails, just change the accepted response
     -- for now
-    , chk "NO goto implementation"  _implementationProvider (Just $ GotoOptionsStatic True)
-    , chk "NO find references"          _referencesProvider  Nothing
-    , chk "   doc highlight"     _documentHighlightProvider  (Just True)
-    , chk "   doc symbol"           _documentSymbolProvider  (Just True)
-    , chk "NO workspace symbol"    _workspaceSymbolProvider  Nothing
-    , chk "   code action"             _codeActionProvider $ Just $ CodeActionOptionsStatic True
-    , chk "   code lens"                 _codeLensProvider $ Just $ CodeLensOptions Nothing
-    , chk "NO doc formatting"   _documentFormattingProvider  Nothing
+    , chk "NO goto implementation"  _implementationProvider (Just $ InL False)
+    , chk "   find references"          _referencesProvider (Just $ InL True)
+    , chk "   doc highlight"     _documentHighlightProvider (Just $ InL True)
+    , chk "   doc symbol"           _documentSymbolProvider (Just $ InL True)
+    , chk "   workspace symbol"    _workspaceSymbolProvider (Just True)
+    , chk "   code action"             _codeActionProvider  (Just $ InL True)
+    , chk "   code lens"                 _codeLensProvider  (Just $ CodeLensOptions (Just False) (Just False))
+    , chk "NO doc formatting"   _documentFormattingProvider (Just $ InL False)
     , chk "NO doc range formatting"
-                           _documentRangeFormattingProvider  Nothing
+                           _documentRangeFormattingProvider (Just $ InL False)
     , chk "NO doc formatting on typing"
-                          _documentOnTypeFormattingProvider  Nothing
-    , chk "NO renaming"                     _renameProvider (Just $ RenameOptionsStatic False)
-    , chk "NO doc link"               _documentLinkProvider  Nothing
-    , chk "NO color"                         _colorProvider (Just $ ColorOptionsStatic False)
-    , chk "NO folding range"          _foldingRangeProvider (Just $ FoldingRangeOptionsStatic False)
-    , che "   execute command"      _executeCommandProvider (Just $ ExecuteCommandOptions $ List [typeSignatureCommandId, blockCommandId])
-    , chk "   workspace"                         _workspace (Just $ WorkspaceOptions (Just WorkspaceFolderOptions{_supported = Just True, _changeNotifications = Just ( WorkspaceFolderChangeNotificationsBool True )}))
-    , chk "NO experimental"                   _experimental  Nothing
+                          _documentOnTypeFormattingProvider Nothing
+    , chk "NO renaming"                     _renameProvider (Just $ InL False)
+    , chk "NO doc link"               _documentLinkProvider Nothing
+    , chk "NO color"                         _colorProvider (Just $ InL False)
+    , chk "NO folding range"          _foldingRangeProvider (Just $ InL False)
+    , che "   execute command"      _executeCommandProvider [blockCommandId, extendImportCommandId, typeLensCommandId]
+    , chk "   workspace"                         _workspace (Just $ WorkspaceServerCapabilities (Just WorkspaceFoldersServerCapabilities{_supported = Just True, _changeNotifications = Just ( InR True )}))
+    , chk "NO experimental"                   _experimental Nothing
     ] where
 
-      tds = Just (TDSOptions (TextDocumentSyncOptions
+      tds = Just (InL (TextDocumentSyncOptions
                               { _openClose = Just True
                               , _change    = Just TdSyncIncremental
                               , _willSave  = Nothing
                               , _willSaveWaitUntil = Nothing
-                              , _save = Just (SaveOptions {_includeText = Nothing})}))
+                              , _save = Just (InR $ SaveOptions {_includeText = Nothing})}))
 
-      chk :: (Eq a, Show a) => TestName -> (InitializeResponseCapabilitiesInner -> a) -> a -> TestTree
+      chk :: (Eq a, Show a) => TestName -> (ServerCapabilities -> a) -> a -> TestTree
       chk title getActual expected =
         testCase title $ getInitializeResponse >>= \ir -> expected @=? (getActual . innerCaps) ir
 
-      che :: TestName -> (InitializeResponseCapabilitiesInner -> Maybe ExecuteCommandOptions) -> Maybe ExecuteCommandOptions -> TestTree
-      che title getActual _expected = testCase title doTest
+      che :: TestName -> (ServerCapabilities -> Maybe ExecuteCommandOptions) -> [T.Text] -> TestTree
+      che title getActual expected = testCase title doTest
         where
             doTest = do
                 ir <- getInitializeResponse
-                let Just ExecuteCommandOptions {_commands = List [command]} = getActual $ innerCaps ir
-                True @=? T.isSuffixOf "typesignature.add" command
+                let Just ExecuteCommandOptions {_commands = List commands} = getActual $ innerCaps ir
+                zipWithM_ (\e o -> T.isSuffixOf e o @? show (e,o)) expected commands
 
+  innerCaps :: ResponseMessage Initialize -> ServerCapabilities
+  innerCaps (ResponseMessage _ _ (Right (InitializeResult c _))) = c
+  innerCaps (ResponseMessage _ _ (Left _)) = error "Initialization error"
 
-  innerCaps :: InitializeResponse -> InitializeResponseCapabilitiesInner
-  innerCaps (ResponseMessage _ _ (Right (InitializeResponseCapabilities c))) = c
-  innerCaps  _ = error "this test only expects inner capabilities"
-
-  acquire :: IO InitializeResponse
+  acquire :: IO (ResponseMessage Initialize)
   acquire = run initializeResponse
 
-  release :: InitializeResponse -> IO ()
+  release :: ResponseMessage Initialize -> IO ()
   release = const $ pure ()
 
 
@@ -192,8 +221,8 @@ diagnosticTests = testGroup "diagnostics"
   , testSessionWait "introduce syntax error" $ do
       let content = T.unlines [ "module Testing where" ]
       doc <- createDoc "Testing.hs" "haskell" content
-      void $ skipManyTill anyMessage (message :: Session WorkDoneProgressCreateRequest)
-      void $ skipManyTill anyMessage (message :: Session WorkDoneProgressBeginNotification)
+      void $ skipManyTill anyMessage (message SWindowWorkDoneProgressCreate)
+      waitForProgressBegin
       let change = TextDocumentContentChangeEvent
             { _range = Just (Range (Position 0 15) (Position 0 18))
             , _rangeLength = Nothing
@@ -471,9 +500,8 @@ diagnosticTests = testGroup "diagnostics"
               in filePathToUri (joinDrive (lower drive) suffix)
           let itemA = TextDocumentItem uriA "haskell" 0 aContent
           let a = TextDocumentIdentifier uriA
-          sendNotification TextDocumentDidOpen (DidOpenTextDocumentParams itemA)
-          diagsNot <- skipManyTill anyMessage diagnostic
-          let PublishDiagnosticsParams fileUri diags = _params (diagsNot :: PublishDiagnosticsNotification)
+          sendNotification STextDocumentDidOpen (DidOpenTextDocumentParams itemA)
+          NotificationMessage{_params = PublishDiagnosticsParams fileUri _ diags} <- skipManyTill anyMessage diagnostic
           -- Check that if we put a lower-case drive in for A.A
           -- the diagnostics for A.B will also be lower-case.
           liftIO $ fileUri @?= uriB
@@ -676,6 +704,9 @@ codeActionTests = testGroup "code actions"
   , removeImportTests
   , extendImportTests
   , suggestImportTests
+  , suggestHideShadowTests
+  , suggestImportDisambiguationTests
+  , disableWarningTests
   , fixConstructorImportTests
   , importRenameActionTests
   , fillTypedHoleTests
@@ -688,6 +719,7 @@ codeActionTests = testGroup "code actions"
   , addTypeAnnotationsToLiteralsTest
   , exportUnusedTests
   , addImplicitParamsConstraintTests
+  , removeExportTests
   ]
 
 codeActionHelperFunctionTests :: TestTree
@@ -707,7 +739,7 @@ watchedFilesTests = testGroup "watched files"
   [ testSession' "workspace files" $ \sessionDir -> do
       liftIO $ writeFile (sessionDir </> "hie.yaml") "cradle: {direct: {arguments: [\"-isrc\", \"A\", \"WatchedFilesMissingModule\"]}}"
       _doc <- createDoc "A.hs" "haskell" "{-#LANGUAGE NoImplicitPrelude #-}\nmodule A where\nimport WatchedFilesMissingModule"
-      watchedFileRegs <- getWatchedFilesSubscriptionsUntil @PublishDiagnosticsNotification
+      watchedFileRegs <- getWatchedFilesSubscriptionsUntil STextDocumentPublishDiagnostics
 
       -- Expect 1 subscription: we only ever send one
       liftIO $ length watchedFileRegs @?= 1
@@ -716,7 +748,7 @@ watchedFilesTests = testGroup "watched files"
       tmpDir <- liftIO getTemporaryDirectory
       liftIO $ writeFile (sessionDir </> "hie.yaml") ("cradle: {direct: {arguments: [\"-i" <> tmpDir <> "\", \"A\", \"WatchedFilesMissingModule\"]}}")
       _doc <- createDoc "A.hs" "haskell" "{-# LANGUAGE NoImplicitPrelude#-}\nmodule A where\nimport WatchedFilesMissingModule"
-      watchedFileRegs <- getWatchedFilesSubscriptionsUntil @PublishDiagnosticsNotification
+      watchedFileRegs <- getWatchedFilesSubscriptionsUntil STextDocumentPublishDiagnostics
 
       -- Expect 1 subscription: we only ever send one
       liftIO $ length watchedFileRegs @?= 1
@@ -783,7 +815,7 @@ renameActionTests = testGroup "rename actions"
       doc <- createDoc "Testing.hs" "haskell" content
       _ <- waitForDiagnostics
       actionsOrCommands <- getCodeActions doc (Range (Position 3 12) (Position 3 20))
-      [fixTypo] <- pure [action | CACodeAction action@CodeAction{ _title = actionTitle } <- actionsOrCommands, "monus" `T.isInfixOf` actionTitle ]
+      [fixTypo] <- pure [action | InR action@CodeAction{ _title = actionTitle } <- actionsOrCommands, "monus" `T.isInfixOf` actionTitle ]
       executeCodeAction fixTypo
       contentAfterAction <- documentContents doc
       let expectedContentAfterAction = T.unlines
@@ -806,7 +838,7 @@ typeWildCardActionTests = testGroup "type wildcard actions"
       doc <- createDoc "Testing.hs" "haskell" content
       _ <- waitForDiagnostics
       actionsOrCommands <- getCodeActions doc (Range (Position 2 1) (Position 2 10))
-      let [addSignature] = [action | CACodeAction action@CodeAction { _title = actionTitle } <- actionsOrCommands
+      let [addSignature] = [action | InR action@CodeAction { _title = actionTitle } <- actionsOrCommands
                                    , "Use type signature" `T.isInfixOf` actionTitle
                            ]
       executeCodeAction addSignature
@@ -826,7 +858,7 @@ typeWildCardActionTests = testGroup "type wildcard actions"
       doc <- createDoc "Testing.hs" "haskell" content
       _ <- waitForDiagnostics
       actionsOrCommands <- getCodeActions doc (Range (Position 2 1) (Position 2 10))
-      let [addSignature] = [action | CACodeAction action@CodeAction { _title = actionTitle } <- actionsOrCommands
+      let [addSignature] = [action | InR action@CodeAction { _title = actionTitle } <- actionsOrCommands
                                     , "Use type signature" `T.isInfixOf` actionTitle
                               ]
       executeCodeAction addSignature
@@ -849,7 +881,7 @@ typeWildCardActionTests = testGroup "type wildcard actions"
       doc <- createDoc "Testing.hs" "haskell" content
       _ <- waitForDiagnostics
       actionsOrCommands <- getCodeActions doc (Range (Position 4 1) (Position 4 10))
-      let [addSignature] = [action | CACodeAction action@CodeAction { _title = actionTitle } <- actionsOrCommands
+      let [addSignature] = [action | InR action@CodeAction { _title = actionTitle } <- actionsOrCommands
                                     , "Use type signature" `T.isInfixOf` actionTitle
                               ]
       executeCodeAction addSignature
@@ -881,9 +913,8 @@ removeImportTests = testGroup "remove import actions"
             ]
       docB <- createDoc "ModuleB.hs" "haskell" contentB
       _ <- waitForDiagnostics
-      [CACodeAction action@CodeAction { _title = actionTitle }, _]
-          <- getCodeActions docB (Range (Position 2 0) (Position 2 5))
-      liftIO $ "Remove import" @=? actionTitle
+      action <- assertJust "Code action not found" . firstJust (caWithTitle "Remove import")
+        =<< getCodeActions docB (Range (Position 2 0) (Position 2 5))
       executeCodeAction action
       contentAfterAction <- documentContents docB
       let expectedContentAfterAction = T.unlines
@@ -907,9 +938,8 @@ removeImportTests = testGroup "remove import actions"
             ]
       docB <- createDoc "ModuleB.hs" "haskell" contentB
       _ <- waitForDiagnostics
-      [CACodeAction action@CodeAction { _title = actionTitle }, _]
-          <- getCodeActions docB (Range (Position 2 0) (Position 2 5))
-      liftIO $ "Remove import" @=? actionTitle
+      action <- assertJust "Code action not found" . firstJust (caWithTitle "Remove import")
+        =<< getCodeActions docB (Range (Position 2 0) (Position 2 5))
       executeCodeAction action
       contentAfterAction <- documentContents docB
       let expectedContentAfterAction = T.unlines
@@ -936,9 +966,8 @@ removeImportTests = testGroup "remove import actions"
             ]
       docB <- createDoc "ModuleB.hs" "haskell" contentB
       _ <- waitForDiagnostics
-      [CACodeAction action@CodeAction { _title = actionTitle }, _]
-          <- getCodeActions docB (Range (Position 2 0) (Position 2 5))
-      liftIO $ "Remove stuffA, stuffC from import" @=? actionTitle
+      action <- assertJust "Code action not found" . firstJust (caWithTitle "Remove stuffA, stuffC from import")
+        =<< getCodeActions docB (Range (Position 2 0) (Position 2 5))
       executeCodeAction action
       contentAfterAction <- documentContents docB
       let expectedContentAfterAction = T.unlines
@@ -965,9 +994,8 @@ removeImportTests = testGroup "remove import actions"
             ]
       docB <- createDoc "ModuleB.hs" "haskell" contentB
       _ <- waitForDiagnostics
-      [CACodeAction action@CodeAction { _title = actionTitle }, _]
-          <- getCodeActions docB (Range (Position 2 0) (Position 2 5))
-      liftIO $ "Remove !!, <?> from import" @=? actionTitle
+      action <- assertJust "Code action not found" . firstJust (caWithTitle "Remove !!, <?> from import")
+        =<< getCodeActions docB (Range (Position 2 0) (Position 2 5))
       executeCodeAction action
       contentAfterAction <- documentContents docB
       let expectedContentAfterAction = T.unlines
@@ -993,9 +1021,8 @@ removeImportTests = testGroup "remove import actions"
             ]
       docB <- createDoc "ModuleB.hs" "haskell" contentB
       _ <- waitForDiagnostics
-      [CACodeAction action@CodeAction { _title = actionTitle }, _]
-          <- getCodeActions docB (Range (Position 2 0) (Position 2 5))
-      liftIO $ "Remove A from import" @=? actionTitle
+      action <- assertJust "Code action not found" . firstJust (caWithTitle "Remove A from import")
+        =<< getCodeActions docB (Range (Position 2 0) (Position 2 5))
       executeCodeAction action
       contentAfterAction <- documentContents docB
       let expectedContentAfterAction = T.unlines
@@ -1020,9 +1047,8 @@ removeImportTests = testGroup "remove import actions"
             ]
       docB <- createDoc "ModuleB.hs" "haskell" contentB
       _ <- waitForDiagnostics
-      [CACodeAction action@CodeAction { _title = actionTitle }, _]
-          <- getCodeActions docB (Range (Position 2 0) (Position 2 5))
-      liftIO $ "Remove A, E, F from import" @=? actionTitle
+      action <- assertJust "Code action not found" . firstJust (caWithTitle "Remove A, E, F from import")
+        =<< getCodeActions docB (Range (Position 2 0) (Position 2 5))
       executeCodeAction action
       contentAfterAction <- documentContents docB
       let expectedContentAfterAction = T.unlines
@@ -1044,9 +1070,8 @@ removeImportTests = testGroup "remove import actions"
             ]
       docB <- createDoc "ModuleB.hs" "haskell" contentB
       _ <- waitForDiagnostics
-      [CACodeAction action@CodeAction { _title = actionTitle }, _]
-          <- getCodeActions docB (Range (Position 2 0) (Position 2 5))
-      liftIO $ "Remove import" @=? actionTitle
+      action <- assertJust "Code action not found" . firstJust (caWithTitle "Remove import")
+        =<< getCodeActions docB (Range (Position 2 0) (Position 2 5))
       executeCodeAction action
       contentAfterAction <- documentContents docB
       let expectedContentAfterAction = T.unlines
@@ -1069,9 +1094,8 @@ removeImportTests = testGroup "remove import actions"
             ]
       doc <- createDoc "ModuleC.hs" "haskell" content
       _ <- waitForDiagnostics
-      [_, _, _, _, CACodeAction action@CodeAction { _title = actionTitle }]
-          <- getCodeActions doc (Range (Position 2 0) (Position 2 5))
-      liftIO $ "Remove all redundant imports" @=? actionTitle
+      action <- assertJust "Code action not found" . firstJust (caWithTitle "Remove all redundant imports")
+        =<< getCodeActions doc (Range (Position 2 0) (Position 2 5))
       executeCodeAction action
       contentAfterAction <- documentContents doc
       let expectedContentAfterAction = T.unlines
@@ -1087,6 +1111,10 @@ removeImportTests = testGroup "remove import actions"
             ]
       liftIO $ expectedContentAfterAction @=? contentAfterAction
   ]
+  where
+    caWithTitle t = \case
+      InR  a@CodeAction{_title} -> guard (_title == t) >> Just a
+      _ -> Nothing
 
 extendImportTests :: TestTree
 extendImportTests = testGroup "extend import actions"
@@ -1112,7 +1140,7 @@ extendImportTests = testGroup "extend import actions"
             ["Add stuffA to the import list of ModuleA"]
             (T.unlines
                     [ "module ModuleB where"
-                    , "import ModuleA as A (stuffA, stuffB)"
+                    , "import ModuleA as A (stuffB, stuffA)"
                     , "main = print (stuffA, stuffB)"
                     ])
         , testSession "extend single line import with operator" $ template
@@ -1132,7 +1160,7 @@ extendImportTests = testGroup "extend import actions"
             ["Add (.*) to the import list of ModuleA"]
             (T.unlines
                     [ "module ModuleB where"
-                    , "import ModuleA as A ((.*), stuffB)"
+                    , "import ModuleA as A (stuffB, (.*))"
                     , "main = print (stuffB .* stuffB)"
                     ])
         , testSession "extend single line import with type" $ template
@@ -1169,7 +1197,26 @@ extendImportTests = testGroup "extend import actions"
             ["Add A(Constructor) to the import list of ModuleA"]
             (T.unlines
                     [ "module ModuleB where"
-                    , "import ModuleA (A(Constructor))"
+                    , "import ModuleA (A (Constructor))"
+                    , "b :: A"
+                    , "b = Constructor"
+                    ])
+        , testSession "extend single line import with constructor (with comments)" $ template
+            [("ModuleA.hs", T.unlines
+                    [ "module ModuleA where"
+                    , "data A = Constructor"
+                    ])]
+            ("ModuleB.hs", T.unlines
+                    [ "module ModuleB where"
+                    , "import ModuleA (A ({-Constructor-}))"
+                    , "b :: A"
+                    , "b = Constructor"
+                    ])
+            (Range (Position 2 5) (Position 2 5))
+            ["Add A(Constructor) to the import list of ModuleA"]
+            (T.unlines
+                    [ "module ModuleB where"
+                    , "import ModuleA (A (Constructor{-Constructor-}))"
                     , "b :: A"
                     , "b = Constructor"
                     ])
@@ -1181,7 +1228,7 @@ extendImportTests = testGroup "extend import actions"
                     ])]
             ("ModuleB.hs", T.unlines
                     [ "module ModuleB where"
-                    , "import ModuleA (A(ConstructorBar), a)"
+                    , "import ModuleA (A (ConstructorBar), a)"
                     , "b :: A"
                     , "b = ConstructorFoo"
                     ])
@@ -1189,7 +1236,7 @@ extendImportTests = testGroup "extend import actions"
             ["Add A(ConstructorFoo) to the import list of ModuleA"]
             (T.unlines
                     [ "module ModuleB where"
-                    , "import ModuleA (A(ConstructorFoo, ConstructorBar), a)"
+                    , "import ModuleA (A (ConstructorBar, ConstructorFoo), a)"
                     , "b :: A"
                     , "b = ConstructorFoo"
                     ])
@@ -1210,7 +1257,7 @@ extendImportTests = testGroup "extend import actions"
             ["Add stuffA to the import list of ModuleA"]
             (T.unlines
                     [ "module ModuleB where"
-                    , "import qualified ModuleA as A (stuffA, stuffB)"
+                    , "import qualified ModuleA as A (stuffB, stuffA)"
                     , "main = print (A.stuffA, A.stuffB)"
                     ])
         , testSession "extend multi line import with value" $ template
@@ -1231,7 +1278,7 @@ extendImportTests = testGroup "extend import actions"
             ["Add stuffA to the import list of ModuleA"]
             (T.unlines
                     [ "module ModuleB where"
-                    , "import ModuleA (stuffA, stuffB"
+                    , "import ModuleA (stuffB, stuffA"
                     , "               )"
                     , "main = print (stuffA, stuffB)"
                     ])
@@ -1252,7 +1299,7 @@ extendImportTests = testGroup "extend import actions"
              "Add m2 to the import list of ModuleA"]
             (T.unlines
                     [ "module ModuleB where"
-                    , "import ModuleA (C(m2, m1))"
+                    , "import ModuleA (C(m1, m2))"
                     , "b = m2"
                     ])
         , testSession "extend single line import with method without class" $ template
@@ -1272,7 +1319,7 @@ extendImportTests = testGroup "extend import actions"
              "Add C(m2) to the import list of ModuleA"]
             (T.unlines
                     [ "module ModuleB where"
-                    , "import ModuleA (m2, C(m1))"
+                    , "import ModuleA (C(m1), m2)"
                     , "b = m2"
                     ])
         , testSession "extend import list with multiple choices" $ template
@@ -1313,7 +1360,7 @@ extendImportTests = testGroup "extend import actions"
             ["Add (:~:)(Refl) to the import list of Data.Type.Equality"]
             (T.unlines
                     [ "module ModuleA where"
-                    , "import Data.Type.Equality ((:~:)(Refl))"
+                    , "import Data.Type.Equality ((:~:) (Refl))"
                     , "x :: (:~:) [] []"
                     , "x = Refl"
                     ])
@@ -1322,7 +1369,7 @@ extendImportTests = testGroup "extend import actions"
         codeActionTitle CodeAction{_title=x} = x
 
         template setUpModules moduleUnderTest range expectedTitles expectedContentB = do
-            sendNotification WorkspaceDidChangeConfiguration
+            sendNotification SWorkspaceDidChangeConfiguration
                 (DidChangeConfigurationParams $ toJSON
                   def{checkProject = overrideCheckProject})
 
@@ -1330,12 +1377,12 @@ extendImportTests = testGroup "extend import actions"
             mapM_ (\x -> createDoc (fst x) "haskell" (snd x)) setUpModules
             docB <- createDoc (fst moduleUnderTest) "haskell" (snd moduleUnderTest)
             _  <- waitForDiagnostics
-            void (skipManyTill anyMessage message :: Session WorkDoneProgressEndNotification)
+            waitForProgressDone
             actionsOrCommands <- getCodeActions docB range
             let codeActions =
                   filter
                     (T.isPrefixOf "Add" . codeActionTitle)
-                    [ca | CACodeAction ca <- actionsOrCommands]
+                    [ca | InR ca <- actionsOrCommands]
                 actualTitles = codeActionTitle <$> codeActions
             -- Note that we are not testing the order of the actions, as the
             -- order of the expected actions indicates which one we'll execute
@@ -1425,7 +1472,7 @@ suggestImportTests = testGroup "suggest import actions"
           cradle = "cradle: {direct: {arguments: [-hide-all-packages, -package, base, -package, text, -package-env, -, A, Bar, Foo]}}"
       liftIO $ writeFileUTF8 (dir </> "hie.yaml") cradle
       doc <- createDoc "Test.hs" "haskell" before
-      void (skipManyTill anyMessage message :: Session WorkDoneProgressEndNotification)
+      waitForProgressDone
       _diags <- waitForDiagnostics
       -- there isn't a good way to wait until the whole project is checked atm
       when waitForCheckProject $ liftIO $ sleep 0.5
@@ -1439,7 +1486,354 @@ suggestImportTests = testGroup "suggest import actions"
              contentAfterAction <- documentContents doc
              liftIO $ after @=? contentAfterAction
           else
-              liftIO $ [_title | CACodeAction CodeAction{_title} <- actions, _title == newImp ] @?= []
+              liftIO $ [_title | InR CodeAction{_title} <- actions, _title == newImp ] @?= []
+
+suggestImportDisambiguationTests :: TestTree
+suggestImportDisambiguationTests = testGroup "suggest import disambiguation actions"
+  [ testGroup "Hiding strategy works"
+    [ testGroup "fromList"
+        [ testCase "AVec" $
+            compareHideFunctionTo [(8,9),(10,8)]
+                "Use AVec for fromList, hiding other imports"
+                "HideFunction.expected.fromList.A.hs"
+        , testCase "BVec" $
+            compareHideFunctionTo [(8,9),(10,8)]
+                "Use BVec for fromList, hiding other imports"
+                "HideFunction.expected.fromList.B.hs"
+        ]
+    , testGroup "(++)"
+        [ testCase "EVec" $
+            compareHideFunctionTo [(8,9),(10,8)]
+                "Use EVec for ++, hiding other imports"
+                "HideFunction.expected.append.E.hs"
+        , testCase "Prelude" $
+            compareHideFunctionTo [(8,9),(10,8)]
+                "Use Prelude for ++, hiding other imports"
+                "HideFunction.expected.append.Prelude.hs"
+        , testCase "AVec, indented" $
+            compareTwo "HidePreludeIndented.hs" [(3,8)]
+            "Use AVec for ++, hiding other imports"
+            "HidePreludeIndented.expected.hs"
+
+        ]
+    , testGroup "Vec (type)"
+        [ testCase "AVec" $
+            compareTwo
+                "HideType.hs" [(8,15)]
+                "Use AVec for Vec, hiding other imports"
+                "HideType.expected.A.hs"
+        , testCase "EVec" $
+            compareTwo
+                "HideType.hs" [(8,15)]
+                "Use EVec for Vec, hiding other imports"
+                "HideType.expected.E.hs"
+        ]
+    ]
+  , testGroup "Qualify strategy"
+    [ testCase "won't suggest full name for qualified module" $
+      withHideFunction [(8,9),(10,8)] $ \_ actions -> do
+        liftIO $
+            assertBool "EVec.fromList must not be suggested" $
+                "Replace with qualified: EVec.fromList" `notElem`
+                [ actionTitle
+                | InR CodeAction { _title = actionTitle } <- actions
+                ]
+        liftIO $
+            assertBool "EVec.++ must not be suggested" $
+                "Replace with qualified: EVec.++" `notElem`
+                [ actionTitle
+                | InR CodeAction { _title = actionTitle } <- actions
+                ]
+    , testGroup "fromList"
+        [ testCase "EVec" $
+            compareHideFunctionTo [(8,9),(10,8)]
+                "Replace with qualified: E.fromList"
+                "HideFunction.expected.qualified.fromList.E.hs"
+        ]
+    , testGroup "(++)"
+        [ testCase "Prelude, parensed" $
+            compareHideFunctionTo [(8,9),(10,8)]
+                "Replace with qualified: Prelude.++"
+                "HideFunction.expected.qualified.append.Prelude.hs"
+        , testCase "Prelude, infix" $
+            compareTwo
+                "HideQualifyInfix.hs" [(4,19)]
+                "Replace with qualified: Prelude.++"
+                "HideQualifyInfix.expected.hs"
+        , testCase "Prelude, left section" $
+            compareTwo
+                "HideQualifySectionLeft.hs" [(4,15)]
+                "Replace with qualified: Prelude.++"
+                "HideQualifySectionLeft.expected.hs"
+        , testCase "Prelude, right section" $
+            compareTwo
+                "HideQualifySectionRight.hs" [(4,18)]
+                "Replace with qualified: Prelude.++"
+                "HideQualifySectionRight.expected.hs"
+        ]
+    ]
+  ]
+  where
+    hidingDir = "test/data/hiding"
+    compareTwo original locs cmd expected =
+        withTarget original locs $ \doc actions -> do
+            expected <- liftIO $
+                readFileUtf8 (hidingDir </> expected)
+            action <- liftIO $ pickActionWithTitle cmd actions
+            executeCodeAction action
+            contentAfterAction <- documentContents doc
+            liftIO $ T.replace "\r\n" "\n" expected @=? contentAfterAction
+    compareHideFunctionTo = compareTwo "HideFunction.hs"
+    auxFiles = ["AVec.hs", "BVec.hs", "CVec.hs", "DVec.hs", "EVec.hs"]
+    withTarget file locs k = withTempDir $ \dir -> runInDir dir $ do
+        liftIO $ mapM_ (\fp -> copyFile (hidingDir </> fp) $ dir </> fp)
+            $ file : auxFiles
+        doc <- openDoc file "haskell"
+        waitForProgressDone
+        void $ expectDiagnostics [(file, [(DsError, loc, "Ambiguous occurrence") | loc <- locs])]
+        contents <- documentContents doc
+        let range = Range (Position 0 0) (Position (length $ T.lines contents) 0)
+        actions <- getCodeActions doc range
+        k doc actions
+    withHideFunction = withTarget ("HideFunction" <.> "hs")
+
+suggestHideShadowTests :: TestTree
+suggestHideShadowTests =
+  testGroup
+    "suggest hide shadow"
+    [ testGroup
+        "single"
+        [ testOneCodeAction
+            "hide unsued"
+            "Hide on from Data.Function"
+            (1, 2)
+            (1, 4)
+            [ "import Data.Function"
+            , "f on = on"
+            , "g on = on"
+            ]
+            [ "import Data.Function hiding (on)"
+            , "f on = on"
+            , "g on = on"
+            ]
+        , testOneCodeAction
+            "extend hiding unsued"
+            "Hide on from Data.Function"
+            (1, 2)
+            (1, 4)
+            [ "import Data.Function hiding ((&))"
+            , "f on = on"
+            ]
+            [ "import Data.Function hiding (on, (&))"
+            , "f on = on"
+            ]
+        , testOneCodeAction
+            "delete unsued"
+            "Hide on from Data.Function"
+            (1, 2)
+            (1, 4)
+            [ "import Data.Function ((&), on)"
+            , "f on = on"
+            ]
+            [ "import Data.Function ((&))"
+            , "f on = on"
+            ]
+        , testOneCodeAction
+            "hide operator"
+            "Hide & from Data.Function"
+            (1, 2)
+            (1, 5)
+            [ "import Data.Function"
+            , "f (&) = (&)"
+            ]
+            [ "import Data.Function hiding ((&))"
+            , "f (&) = (&)"
+            ]
+        , testOneCodeAction
+            "remove operator"
+            "Hide & from Data.Function"
+            (1, 2)
+            (1, 5)
+            [ "import Data.Function ((&), on)"
+            , "f (&) = (&)"
+            ]
+            [ "import Data.Function ( on)"
+            , "f (&) = (&)"
+            ]
+        , noCodeAction
+            "don't remove already used"
+            (2, 2)
+            (2, 4)
+            [ "import Data.Function"
+            , "g = on"
+            , "f on = on"
+            ]
+        ]
+    , testGroup
+        "multi"
+        [ testOneCodeAction
+            "hide from B"
+            "Hide ++ from B"
+            (2, 2)
+            (2, 6)
+            [ "import B"
+            , "import C"
+            , "f (++) = (++)"
+            ]
+            [ "import B hiding ((++))"
+            , "import C"
+            , "f (++) = (++)"
+            ]
+        , testOneCodeAction
+            "hide from C"
+            "Hide ++ from C"
+            (2, 2)
+            (2, 6)
+            [ "import B"
+            , "import C"
+            , "f (++) = (++)"
+            ]
+            [ "import B"
+            , "import C hiding ((++))"
+            , "f (++) = (++)"
+            ]
+        , testOneCodeAction
+            "hide from Prelude"
+            "Hide ++ from Prelude"
+            (2, 2)
+            (2, 6)
+            [ "import B"
+            , "import C"
+            , "f (++) = (++)"
+            ]
+            [ "import B"
+            , "import C"
+            , "import Prelude hiding ((++))"
+            , "f (++) = (++)"
+            ]
+        , testMultiCodeActions
+            "manual hide all"
+            [ "Hide ++ from Prelude"
+            , "Hide ++ from C"
+            , "Hide ++ from B"
+            ]
+            (2, 2)
+            (2, 6)
+            [ "import B"
+            , "import C"
+            , "f (++) = (++)"
+            ]
+            [ "import B hiding ((++))"
+            , "import C hiding ((++))"
+            , "import Prelude hiding ((++))"
+            , "f (++) = (++)"
+            ]
+        , testOneCodeAction
+            "auto hide all"
+            "Hide ++ from all occurence imports"
+            (2, 2)
+            (2, 6)
+            [ "import B"
+            , "import C"
+            , "f (++) = (++)"
+            ]
+            [ "import B hiding ((++))"
+            , "import C hiding ((++))"
+            , "import Prelude hiding ((++))"
+            , "f (++) = (++)"
+            ]
+        ]
+    ]
+ where
+  testOneCodeAction testName actionName start end origin expected =
+    helper testName start end origin expected $ \cas -> do
+      action <- liftIO $ pickActionWithTitle actionName cas
+      executeCodeAction action
+  noCodeAction testName start end origin =
+    helper testName start end origin origin $ \cas -> do
+      liftIO $ cas @?= []
+  testMultiCodeActions testName actionNames start end origin expected =
+    helper testName start end origin expected $ \cas -> do
+      let r = [ca | (InR ca) <- cas, ca ^. L.title `elem` actionNames]
+      liftIO $
+        (length r == length actionNames)
+          @? "Expected " <> show actionNames <> ", but got " <> show cas <> " which is not its superset"
+      forM_ r executeCodeAction
+  helper testName (line1, col1) (line2, col2) origin expected k = testSession testName $ do
+    void $ createDoc "B.hs" "haskell" $ T.unlines docB
+    void $ createDoc "C.hs" "haskell" $ T.unlines docC
+    doc <- createDoc "A.hs" "haskell" $ T.unlines (header <> origin)
+    void waitForDiagnostics
+    waitForProgressDone
+    cas <- getCodeActions doc (Range (Position (line1 + length header) col1) (Position (line2 + length header) col2))
+    void $ k [x | x@(InR ca) <- cas, "Hide" `T.isPrefixOf` (ca ^. L.title)]
+    contentAfter <- documentContents doc
+    liftIO $ contentAfter @?= T.unlines (header <> expected)
+  header =
+    [ "{-# OPTIONS_GHC -Wname-shadowing #-}"
+    , "module A where"
+    , ""
+    ]
+  -- for multi group
+  docB =
+    [ "module B where"
+    , "(++) = id"
+    ]
+  docC =
+    [ "module C where"
+    , "(++) = id"
+    ]
+
+disableWarningTests :: TestTree
+disableWarningTests =
+  testGroup "disable warnings" $
+    [
+      ( "missing-signatures"
+      , T.unlines
+          [ "{-# OPTIONS_GHC -Wall #-}"
+          , "main = putStrLn \"hello\""
+          ]
+      , T.unlines
+          [ "{-# OPTIONS_GHC -Wall #-}"
+          , "{-# OPTIONS_GHC -Wno-missing-signatures #-}"
+          , "main = putStrLn \"hello\""
+          ]
+      )
+    ,
+      ( "unused-imports"
+      , T.unlines
+          [ "{-# OPTIONS_GHC -Wall #-}"
+          , ""
+          , ""
+          , "module M where"
+          , ""
+          , "import Data.Functor"
+          ]
+      , T.unlines
+          [ "{-# OPTIONS_GHC -Wall #-}"
+          , "{-# OPTIONS_GHC -Wno-unused-imports #-}"
+          , ""
+          , ""
+          , "module M where"
+          , ""
+          , "import Data.Functor"
+          ]
+      )
+    ]
+      <&> \(warning, initialContent, expectedContent) -> testSession (T.unpack warning) $ do
+        doc <- createDoc "Module.hs" "haskell" initialContent
+        _ <- waitForDiagnostics
+        codeActs <- mapMaybe caResultToCodeAct <$> getCodeActions doc (Range (Position 0 0) (Position 0 0))
+        case find (\CodeAction{_title} -> _title == "Disable \"" <> warning <> "\" warnings") codeActs of
+          Nothing -> liftIO $ assertFailure "No code action with expected title"
+          Just action -> do
+            executeCodeAction action
+            contentAfterAction <- documentContents doc
+            liftIO $ expectedContent @=? contentAfterAction
+ where
+  caResultToCodeAct = \case
+    InL _ -> Nothing
+    InR c -> Just c
 
 insertNewDefinitionTests :: TestTree
 insertNewDefinitionTests = testGroup "insert new definition actions"
@@ -1455,8 +1849,8 @@ insertNewDefinitionTests = testGroup "insert new definition actions"
             ]
       docB <- createDoc "ModuleB.hs" "haskell" (T.unlines $ txtB ++ txtB')
       _ <- waitForDiagnostics
-      CACodeAction action@CodeAction { _title = actionTitle } : _
-                  <- sortOn (\(CACodeAction CodeAction{_title=x}) -> x) <$>
+      InR action@CodeAction { _title = actionTitle } : _
+                  <- sortOn (\(InR CodeAction{_title=x}) -> x) <$>
                      getCodeActions docB (R 1 0 1 50)
       liftIO $ actionTitle @?= "Define select :: [Bool] -> Bool"
       executeCodeAction action
@@ -1479,8 +1873,8 @@ insertNewDefinitionTests = testGroup "insert new definition actions"
             ]
       docB <- createDoc "ModuleB.hs" "haskell" (T.unlines $ txtB ++ txtB')
       _ <- waitForDiagnostics
-      CACodeAction action@CodeAction { _title = actionTitle } : _
-                  <- sortOn (\(CACodeAction CodeAction{_title=x}) -> x) <$>
+      InR action@CodeAction { _title = actionTitle } : _
+                  <- sortOn (\(InR CodeAction{_title=x}) -> x) <$>
                      getCodeActions docB (R 1 0 1 50)
       liftIO $ actionTitle @?= "Define select :: [Bool] -> Bool"
       executeCodeAction action
@@ -1797,8 +2191,8 @@ fixConstructorImportTests = testGroup "fix import actions"
       _docA <- createDoc "ModuleA.hs" "haskell" contentA
       docB  <- createDoc "ModuleB.hs" "haskell" contentB
       _diags <- waitForDiagnostics
-      CACodeAction action@CodeAction { _title = actionTitle } : _
-                  <- sortOn (\(CACodeAction CodeAction{_title=x}) -> x) <$>
+      InR action@CodeAction { _title = actionTitle } : _
+                  <- sortOn (\(InR CodeAction{_title=x}) -> x) <$>
                      getCodeActions docB range
       liftIO $ expectedAction @=? actionTitle
       executeCodeAction action
@@ -1817,7 +2211,7 @@ importRenameActionTests = testGroup "import rename actions"
       doc <- createDoc "Testing.hs" "haskell" content
       _ <- waitForDiagnostics
       actionsOrCommands <- getCodeActions doc (Range (Position 2 8) (Position 2 16))
-      let [changeToMap] = [action | CACodeAction action@CodeAction{ _title = actionTitle } <- actionsOrCommands, ("Data." <> modname) `T.isInfixOf` actionTitle ]
+      let [changeToMap] = [action | InR action@CodeAction{ _title = actionTitle } <- actionsOrCommands, ("Data." <> modname) `T.isInfixOf` actionTitle ]
       executeCodeAction changeToMap
       contentAfterAction <- documentContents doc
       let expectedContentAfterAction = T.unlines
@@ -2192,7 +2586,12 @@ removeRedundantConstraintsTests = let
     doc <- createDoc "Testing.hs" "haskell" code
     _ <- waitForDiagnostics
     actionsOrCommands <- getCodeActions doc (Range (Position 4 0) (Position 4 maxBound))
-    liftIO $ assertBool "Found some actions" (null actionsOrCommands)
+    liftIO $ assertBool "Found some actions (other than \"disable warnings\")"
+      $ all isDisableWarningAction actionsOrCommands
+    where
+      isDisableWarningAction = \case
+        InR CodeAction{_title} -> "Disable" `T.isPrefixOf` _title && "warnings" `T.isSuffixOf` _title
+        _ -> False
 
   in testGroup "remove redundant function constraints"
   [ check
@@ -2425,7 +2824,7 @@ exportUnusedTests = testGroup "export unused actions"
               [ "{-# OPTIONS_GHC -Wunused-top-binds #-}"
               , "module A (f) where"
               , "a `f` b = ()"])
-   , testSession "function operator" $ template
+    , testSession "function operator" $ template
         (T.unlines
               [ "{-# OPTIONS_GHC -Wunused-top-binds #-}"
               , "module A () where"
@@ -2505,19 +2904,199 @@ exportUnusedTests = testGroup "export unused actions"
               , "data (:<) = Foo ()"])
     ]
   ]
-    where
-      template initialContent range expectedAction expectedContents = do
-        doc <- createDoc "A.hs" "haskell" initialContent
-        _ <- waitForDiagnostics
-        actions <- getCodeActions doc range
-        case expectedContents of
-          Just content -> do
-            action <- liftIO $ pickActionWithTitle expectedAction actions
-            executeCodeAction action
-            contentAfterAction <- documentContents doc
-            liftIO $ content @=? contentAfterAction
-          Nothing ->
-            liftIO $ [_title | CACodeAction CodeAction{_title} <- actions, _title == expectedAction ] @?= []
+  where
+    template doc range = exportTemplate (Just range) doc
+
+exportTemplate :: Maybe Range -> T.Text -> T.Text -> Maybe T.Text -> Session ()
+exportTemplate mRange initialContent expectedAction expectedContents = do
+  doc <- createDoc "A.hs" "haskell" initialContent
+  _ <- waitForDiagnostics
+  actions <- case mRange of
+    Nothing -> getAllCodeActions doc
+    Just range -> getCodeActions doc range
+  case expectedContents of
+    Just content -> do
+      action <- liftIO $ pickActionWithTitle expectedAction actions
+      executeCodeAction action
+      contentAfterAction <- documentContents doc
+      liftIO $ content @=? contentAfterAction
+    Nothing ->
+      liftIO $ [_title | InR CodeAction{_title} <- actions, _title == expectedAction ] @?= []
+
+removeExportTests :: TestTree
+removeExportTests = testGroup "remove export actions"
+    [ testSession "single export" $ template
+        (T.unlines
+              [ "module A (  a   ) where"
+              , "b :: ()"
+              , "b = ()"])
+        "Remove ‘a’ from export"
+        (Just $ T.unlines
+              [ "module A (     ) where"
+              , "b :: ()"
+              , "b = ()"])
+    , testSession "ending comma" $ template
+        (T.unlines
+              [ "module A (  a,   ) where"
+              , "b :: ()"
+              , "b = ()"])
+        "Remove ‘a’ from export"
+        (Just $ T.unlines
+              [ "module A (  ) where"
+              , "b :: ()"
+              , "b = ()"])
+    , testSession "multiple exports" $ template
+        (T.unlines
+              [ "module A (a  ,   c,    b ) where"
+              , "a, c :: ()"
+              , "a = ()"
+              , "c = ()"])
+        "Remove ‘b’ from export"
+        (Just $ T.unlines
+              [ "module A (a  ,   c ) where"
+              , "a, c :: ()"
+              , "a = ()"
+              , "c = ()"])
+    , testSession "not in scope constructor" $ template
+        (T.unlines
+              [ "module A (A (X,Y,Z,(:<)), ab) where"
+              , "data A = X Int | Y | (:<) Int"
+              , "ab :: ()"
+              , "ab = ()"
+              ])
+        "Remove ‘Z’ from export"
+        (Just $ T.unlines
+              [ "module A (A (X,Y,(:<)), ab) where"
+              , "data A = X Int | Y | (:<) Int"
+              , "ab :: ()"
+              , "ab = ()"])
+    , testSession "multiline export" $ template
+        (T.unlines
+              [ "module A (a"
+              , " ,  b"
+              , " , (:*:)"
+              , " , ) where"
+              , "a,b :: ()"
+              , "a = ()"
+              , "b = ()"])
+        "Remove ‘:*:’ from export"
+        (Just $ T.unlines
+              [ "module A (a"
+              , " ,  b"
+              , " "
+              , " , ) where"
+              , "a,b :: ()"
+              , "a = ()"
+              , "b = ()"])
+    , testSession "qualified re-export" $ template
+        (T.unlines
+              [ "module A (M.x,a) where"
+              , "import qualified Data.List as M"
+              , "a :: ()"
+              , "a = ()"])
+        "Remove ‘M.x’ from export"
+        (Just $ T.unlines
+              [ "module A (a) where"
+              , "import qualified Data.List as M"
+              , "a :: ()"
+              , "a = ()"])
+    , testSession "export module" $ template
+        (T.unlines
+              [ "module A (module B) where"
+              , "a :: ()"
+              , "a = ()"])
+        "Remove ‘module B’ from export"
+        (Just $ T.unlines
+              [ "module A () where"
+              , "a :: ()"
+              , "a = ()"])
+    , testSession "dodgy export" $ template
+        (T.unlines
+              [ "{-# OPTIONS_GHC -Wall #-}"
+              , "module A (A (..)) where"
+              , "data X = X"
+              , "type A = X"])
+        "Remove ‘A(..)’ from export"
+        (Just $ T.unlines
+              [ "{-# OPTIONS_GHC -Wall #-}"
+              , "module A () where"
+              , "data X = X"
+              , "type A = X"])
+    , testSession "dodgy export" $ template
+        (T.unlines
+              [ "{-# OPTIONS_GHC -Wall #-}"
+              , "module A (A (..)) where"
+              , "data X = X"
+              , "type A = X"])
+        "Remove ‘A(..)’ from export"
+        (Just $ T.unlines
+              [ "{-# OPTIONS_GHC -Wall #-}"
+              , "module A () where"
+              , "data X = X"
+              , "type A = X"])
+    , testSession "duplicate module export" $ template
+        (T.unlines
+              [ "{-# OPTIONS_GHC -Wall #-}"
+              , "module A (module L,module L) where"
+              , "import Data.List as L"
+              , "a :: ()"
+              , "a = ()"])
+        "Remove ‘Module L’ from export"
+        (Just $ T.unlines
+              [ "{-# OPTIONS_GHC -Wall #-}"
+              , "module A (module L) where"
+              , "import Data.List as L"
+              , "a :: ()"
+              , "a = ()"])
+    , testSession "remove all exports single" $ template
+        (T.unlines
+              [ "module A (x) where"
+              , "a :: ()"
+              , "a = ()"])
+        "Remove all redundant exports"
+        (Just $ T.unlines
+              [ "module A () where"
+              , "a :: ()"
+              , "a = ()"])
+    , testSession "remove all exports two" $ template
+        (T.unlines
+              [ "module A (x,y) where"
+              , "a :: ()"
+              , "a = ()"])
+        "Remove all redundant exports"
+        (Just $ T.unlines
+              [ "module A () where"
+              , "a :: ()"
+              , "a = ()"])
+    , testSession "remove all exports three" $ template
+        (T.unlines
+              [ "module A (a,x,y) where"
+              , "a :: ()"
+              , "a = ()"])
+        "Remove all redundant exports"
+        (Just $ T.unlines
+              [ "module A (a) where"
+              , "a :: ()"
+              , "a = ()"])
+    , testSession "remove all exports composite" $ template
+        (T.unlines
+              [ "module A (x,y,b, module Ls, a, A(X,getW, Y, Z,(:-),getV), (-+), B(B)) where"
+              , "data A = X {getV :: Int} | Y {getV :: Int}"
+              , "data B = B"
+              , "a,b :: ()"
+              , "a = ()"
+              , "b = ()"])
+        "Remove all redundant exports"
+        (Just $ T.unlines
+              [ "module A (b, a, A(X, Y,getV), B(B)) where"
+              , "data A = X {getV :: Int} | Y {getV :: Int}"
+              , "data B = B"
+              , "a,b :: ()"
+              , "a = ()"
+              , "b = ()"])
+    ]
+  where
+    template = exportTemplate Nothing
 
 addSigLensesTests :: TestTree
 addSigLensesTests = let
@@ -2536,7 +3115,7 @@ addSigLensesTests = let
     doc <- createDoc "Sigs.hs" "haskell" originalCode
     [CodeLens {_command = Just c}] <- getCodeLenses doc
     executeCommand c
-    modifiedCode <- getDocumentEdit doc
+    modifiedCode <- skipManyTill anyMessage (getDocumentEdit doc)
     liftIO $ expectedCode @=? modifiedCode
   in
   testGroup "add signature"
@@ -2556,9 +3135,11 @@ addSigLensesTests = let
         ]
     ]
 
-checkDefs :: [Location] -> Session [Expect] -> Session ()
-checkDefs defs mkExpectations = traverse_ check =<< mkExpectations where
+linkToLocation :: [LocationLink] -> [Location]
+linkToLocation = map (\LocationLink{_targetUri,_targetRange} -> Location _targetUri _targetRange)
 
+checkDefs :: [Location] |? [LocationLink] -> Session [Expect] -> Session ()
+checkDefs (either id linkToLocation . toEither -> defs) mkExpectations = traverse_ check =<< mkExpectations where
   check (ExpectRange expectedRange) = do
     assertNDefinitionsFound 1 defs
     assertRangeCorrect (head defs) expectedRange
@@ -2585,6 +3166,7 @@ canonicalizeLocation (Location uri range) = Location <$> canonicalizeUri uri <*>
 findDefinitionAndHoverTests :: TestTree
 findDefinitionAndHoverTests = let
 
+  tst :: (TextDocumentIdentifier -> Position -> Session a, a -> Session [Expect] -> Session ()) -> Position -> Session [Expect] -> String -> TestTree
   tst (get, check) pos targetRange title = testSessionWithExtraFiles "hover" title $ \dir -> do
 
     -- Dirty the cache to check that definitions work even in the presence of iface files
@@ -2596,7 +3178,7 @@ findDefinitionAndHoverTests = let
       closeDoc fooDoc
 
     doc <- openTestDataDoc (dir </> sourceFilePath)
-    void (skipManyTill anyMessage message :: Session WorkDoneProgressEndNotification)
+    waitForProgressDone
     found <- get doc pos
     check found targetRange
 
@@ -2631,7 +3213,7 @@ findDefinitionAndHoverTests = let
         Position{_line = l + 1, _character = c + 1}
     in
     case map (read . T.unpack) lineCol of
-      [l,c] -> liftIO $ (adjust $ _start expectedRange) @=? Position l c
+      [l,c] -> liftIO $ adjust (_start expectedRange) @=? Position l c
       _     -> liftIO $ assertFailure $
         "expected: " <> show ("[...]" <> sourceFileName <> ":<LINE>:<COL>**[...]", Just expectedRange) <>
         "\n but got: " <> show (msg, rangeInHover)
@@ -2653,7 +3235,7 @@ findDefinitionAndHoverTests = let
     , testGroup "type-definition" typeDefinitionTests ]
 
   typeDefinitionTests = [ tst (getTypeDefinitions, checkDefs) aaaL14 (pure tcData) "Saturated data con"
-                        , tst (getTypeDefinitions, checkDefs) opL16 (pure [ExpectNoDefinitions]) "Polymorphic variable"]
+                        , tst (getTypeDefinitions, checkDefs) aL20 (pure [ExpectNoDefinitions]) "Polymorphic variable"]
 
   test runDef runHover look expect = testM runDef runHover look (return expect)
 
@@ -2667,6 +3249,7 @@ findDefinitionAndHoverTests = let
   fffL4  = _start fffR     ;  fffR = mkRange 8  4    8  7 ; fff  = [ExpectRange fffR]
   fffL8  = Position 12  4  ;
   fffL14 = Position 18  7  ;
+  aL20   = Position 19 15
   aaaL14 = Position 18 20  ;  aaa    = [mkR  11  0   11  3]
   dcL7   = Position 11 11  ;  tcDC   = [mkR   7 23    9 16]
   dcL12  = Position 16 11  ;
@@ -2766,7 +3349,6 @@ checkFileCompiles fp diag =
 
 pluginSimpleTests :: TestTree
 pluginSimpleTests =
-  ignoreTest8101 "GHC #18070" $
   ignoreInWindowsForGHC88And810 $
   testSessionWithExtraFiles "plugin" "simple plugin" $ \dir -> do
     _ <- openDoc (dir </> "KnownNat.hs") "haskell"
@@ -2781,7 +3363,6 @@ pluginSimpleTests =
 
 pluginParsedResultTests :: TestTree
 pluginParsedResultTests =
-  ignoreTest8101 "GHC #18070" $
   ignoreInWindowsForGHC88And810 $
   testSessionWithExtraFiles "plugin" "parsedResultAction plugin" $ \dir -> do
     _ <- openDoc (dir</> "RecordDot.hs") "haskell"
@@ -3036,12 +3617,62 @@ completionTest name src pos expected = testSessionWait name $ do
     let compls' = [ (_label, _kind, _insertText, _additionalTextEdits) | CompletionItem{..} <- compls]
     liftIO $ do
         let emptyToMaybe x = if T.null x then Nothing else Just x
-        compls' @?= [ (l, Just k, emptyToMaybe t, at) | (l,k,t,_,_,at) <- expected]
+        sortOn (Lens.view Lens._1) compls' @?=
+            sortOn (Lens.view Lens._1) [ (l, Just k, emptyToMaybe t, at) | (l,k,t,_,_,at) <- expected]
         forM_ (zip compls expected) $ \(CompletionItem{..}, (_,_,_,expectedSig, expectedDocs, _)) -> do
             when expectedSig $
                 assertBool ("Missing type signature: " <> T.unpack _label) (isJust _detail)
             when expectedDocs $
                 assertBool ("Missing docs: " <> T.unpack _label) (isJust _documentation)
+
+completionCommandTest ::
+  String ->
+  [T.Text] ->
+  Position ->
+  T.Text ->
+  [T.Text] ->
+  TestTree
+completionCommandTest name src pos wanted expected = testSession name $ do
+  docId <- createDoc "A.hs" "haskell" (T.unlines src)
+  _ <- waitForDiagnostics
+  compls <- skipManyTill anyMessage (getCompletions docId pos)
+  let wantedC = find ( \case
+            CompletionItem {_insertText = Just x} -> wanted `T.isPrefixOf` x
+            _ -> False
+            ) compls
+  case wantedC of
+    Nothing ->
+      liftIO $ assertFailure $ "Cannot find expected completion in: " <> show [_label | CompletionItem {_label} <- compls]
+    Just CompletionItem {..} -> do
+      c <- assertJust "Expected a command" _command
+      executeCommand c
+      if src /= expected
+          then do
+            modifiedCode <- skipManyTill anyMessage (getDocumentEdit docId)
+            liftIO $ modifiedCode @?= T.unlines expected
+          else do
+            expectMessages SWorkspaceApplyEdit 1 $ \edit ->
+              liftIO $ assertFailure $ "Expected no edit but got: " <> show edit
+
+completionNoCommandTest ::
+  String ->
+  [T.Text] ->
+  Position ->
+  T.Text ->
+  TestTree
+completionNoCommandTest name src pos wanted = testSession name $ do
+  docId <- createDoc "A.hs" "haskell" (T.unlines src)
+  _ <- waitForDiagnostics
+  compls <- getCompletions docId pos
+  let wantedC = find ( \case
+            CompletionItem {_insertText = Just x} -> wanted `T.isPrefixOf` x
+            _ -> False
+            ) compls
+  case wantedC of
+    Nothing ->
+      liftIO $ assertFailure $ "Cannot find expected completion in: " <> show [_label | CompletionItem {_label} <- compls]
+    Just CompletionItem{..} -> liftIO . assertBool ("Expected no command but got: " <> show _command) $ null _command
+
 
 topLevelCompletionTests :: [TestTree]
 topLevelCompletionTests = [
@@ -3191,46 +3822,112 @@ nonLocalCompletionTests =
        ]
        (Position 3 6)
        [],
-    expectFailBecause "Auto import completion snippets were disabled in v0.6.0.2" $
-      testGroup "auto import snippets"
-      [ completionTest
+    testGroup "auto import snippets"
+      [ completionCommandTest
         "show imports not in list - simple"
         ["{-# LANGUAGE NoImplicitPrelude #-}",
         "module A where", "import Control.Monad (msum)", "f = joi"]
         (Position 3 6)
-        [("join", CiFunction, "join ${1:m (m a)}", False, False,
-            Just (List [TextEdit {_range = Range {_start = Position {_line = 2, _character = 26}, _end = Position {_line = 2, _character = 26}}, _newText = "join, "}]))]
-      , completionTest
+        "join"
+        ["{-# LANGUAGE NoImplicitPrelude #-}",
+        "module A where", "import Control.Monad (msum, join)", "f = joi"]
+      , completionCommandTest
         "show imports not in list - multi-line"
         ["{-# LANGUAGE NoImplicitPrelude #-}",
         "module A where", "import Control.Monad (\n    msum)", "f = joi"]
         (Position 4 6)
-        [("join", CiFunction, "join ${1:m (m a)}", False, False,
-            Just (List [TextEdit {_range = Range {_start = Position {_line = 3, _character = 8}, _end = Position {_line = 3, _character = 8}}, _newText = "join, "}]))]
-      , completionTest
+        "join"
+        ["{-# LANGUAGE NoImplicitPrelude #-}",
+        "module A where", "import Control.Monad (\n    msum, join)", "f = joi"]
+      , completionCommandTest
         "show imports not in list - names with _"
         ["{-# LANGUAGE NoImplicitPrelude #-}",
-        "module A where", "import qualified Control.Monad as M (msum)", "f = M.mapM_"]
+        "module A where", "import Control.Monad as M (msum)", "f = M.mapM_"]
         (Position 3 11)
-        [("mapM_", CiFunction, "mapM_ ${1:a -> m b} ${2:t a}", False, False,
-            Just (List [TextEdit {_range = Range {_start = Position {_line = 2, _character = 41}, _end = Position {_line = 2, _character = 41}}, _newText = "mapM_, "}]))]
-      , completionTest
+        "mapM_"
+        ["{-# LANGUAGE NoImplicitPrelude #-}",
+        "module A where", "import Control.Monad as M (msum, mapM_)", "f = M.mapM_"]
+      , completionCommandTest
         "show imports not in list - initial empty list"
         ["{-# LANGUAGE NoImplicitPrelude #-}",
-        "module A where", "import qualified Control.Monad as M ()", "f = M.joi"]
+        "module A where", "import Control.Monad as M ()", "f = M.joi"]
         (Position 3 10)
-        [("join", CiFunction, "join ${1:m (m a)}", False, False,
-            Just (List [TextEdit {_range = Range {_start = Position {_line = 2, _character = 37}, _end = Position {_line = 2, _character = 37}}, _newText = "join, "}]))]
-      , completionTest
-        "record snippet on import"
-        ["module A where", "import Text.Printf (FormatParse(FormatParse))", "FormatParse"]
-        (Position 2 10)
-        [("FormatParse", CiStruct, "FormatParse ", False, False,
-        Just (List [TextEdit {_range = Range {_start = Position {_line = 1, _character = 44}, _end = Position {_line = 1, _character = 44}}, _newText = "FormatParse, "}])),
-        ("FormatParse", CiConstructor, "FormatParse ${1:String} ${2:Char} ${3:String}", False, False,
-        Just (List [TextEdit {_range = Range {_start = Position {_line = 1, _character = 44}, _end = Position {_line = 1, _character = 44}}, _newText = "FormatParse, "}])),
-        ("FormatParse", CiSnippet, "FormatParse {fpModifiers=${1:_fpModifiers}, fpChar=${2:_fpChar}, fpRest=${3:_fpRest}}", False, False,
-        Just (List [TextEdit {_range = Range {_start = Position {_line = 1, _character = 44}, _end = Position {_line = 1, _character = 44}}, _newText = "FormatParse, "}]))
+        "join"
+        ["{-# LANGUAGE NoImplicitPrelude #-}",
+        "module A where", "import Control.Monad as M (join)", "f = M.joi"]
+      , testGroup "qualified imports"
+        [ completionCommandTest
+            "single"
+            ["{-# LANGUAGE NoImplicitPrelude #-}",
+            "module A where", "import Control.Monad ()", "f = Control.Monad.joi"]
+            (Position 3 22)
+            "join"
+            ["{-# LANGUAGE NoImplicitPrelude #-}",
+            "module A where", "import Control.Monad (join)", "f = Control.Monad.joi"]
+        , completionCommandTest
+            "as"
+            ["{-# LANGUAGE NoImplicitPrelude #-}",
+            "module A where", "import Control.Monad as M ()", "f = M.joi"]
+            (Position 3 10)
+            "join"
+            ["{-# LANGUAGE NoImplicitPrelude #-}",
+            "module A where", "import Control.Monad as M (join)", "f = M.joi"]
+        , completionCommandTest
+            "multiple"
+            ["{-# LANGUAGE NoImplicitPrelude #-}",
+            "module A where", "import Control.Monad as M ()", "import Control.Monad as N ()", "f = N.joi"]
+            (Position 4 10)
+            "join"
+            ["{-# LANGUAGE NoImplicitPrelude #-}",
+            "module A where", "import Control.Monad as M ()", "import Control.Monad as N (join)", "f = N.joi"]
+        ]
+      , testGroup "Data constructor"
+        [ completionCommandTest
+            "not imported"
+            ["module A where", "import Text.Printf ()", "ZeroPad"]
+            (Position 2 4)
+            "ZeroPad"
+            ["module A where", "import Text.Printf (FormatAdjustment (ZeroPad))", "ZeroPad"]
+        , completionCommandTest
+            "parent imported abs"
+            ["module A where", "import Text.Printf (FormatAdjustment)", "ZeroPad"]
+            (Position 2 4)
+            "ZeroPad"
+            ["module A where", "import Text.Printf (FormatAdjustment (ZeroPad))", "ZeroPad"]
+        , completionNoCommandTest
+            "parent imported all"
+            ["module A where", "import Text.Printf (FormatAdjustment (..))", "ZeroPad"]
+            (Position 2 4)
+            "ZeroPad"
+        , completionNoCommandTest
+            "already imported"
+            ["module A where", "import Text.Printf (FormatAdjustment (ZeroPad))", "ZeroPad"]
+            (Position 2 4)
+            "ZeroPad"
+        , completionNoCommandTest
+            "function from Prelude"
+            ["module A where", "import Data.Maybe ()", "Nothing"]
+            (Position 2 4)
+            "Nothing"
+        ]
+      , testGroup "Record completion"
+        [ completionCommandTest
+            "not imported"
+            ["module A where", "import Text.Printf ()", "FormatParse"]
+            (Position 2 10)
+            "FormatParse {"
+            ["module A where", "import Text.Printf (FormatParse (FormatParse))", "FormatParse"]
+        , completionCommandTest
+            "parent imported"
+            ["module A where", "import Text.Printf (FormatParse)", "FormatParse"]
+            (Position 2 10)
+            "FormatParse {"
+            ["module A where", "import Text.Printf (FormatParse (FormatParse))", "FormatParse"]
+        , completionNoCommandTest
+            "already imported"
+            ["module A where", "import Text.Printf (FormatParse (FormatParse))", "FormatParse"]
+            (Position 2 10)
+            "FormatParse {"
         ]
       ],
       -- we need this test to make sure the ghcide completions module does not return completions for language pragmas. this functionality is turned on in hls
@@ -3264,6 +3961,27 @@ otherCompletionTests = [
       (Position 3 11)
       [("Integer", CiStruct, "Integer ", True, True, Nothing)],
 
+    testSession "duplicate record fields" $ do
+      void $
+        createDoc "B.hs" "haskell" $
+          T.unlines
+            [ "{-# LANGUAGE DuplicateRecordFields #-}",
+              "module B where",
+              "newtype Foo = Foo { member :: () }",
+              "newtype Bar = Bar { member :: () }"
+            ]
+      docA <-
+        createDoc "A.hs" "haskell" $
+          T.unlines
+            [ "module A where",
+              "import B",
+              "memb"
+            ]
+      _ <- waitForDiagnostics
+      compls <- getCompletions docA $ Position 2 4
+      let compls' = [txt | CompletionItem {_insertText = Just txt, ..} <- compls, _label == "member"]
+      liftIO $ compls' @?= ["member ${1:Foo}", "member ${1:Bar}"],
+
     testSessionWait "maxCompletions" $ do
         doc <- createDoc "A.hs" "haskell" $ T.unlines
             [ "{-# OPTIONS_GHC -Wunused-binds #-}",
@@ -3281,7 +3999,7 @@ highlightTests = testGroup "highlight"
     doc <- createDoc "A.hs" "haskell" source
     _ <- waitForDiagnostics
     highlights <- getHighlights doc (Position 3 2)
-    liftIO $ highlights @?=
+    liftIO $ highlights @?= List
             [ DocumentHighlight (R 2 0 2 3) (Just HkRead)
             , DocumentHighlight (R 3 0 3 3) (Just HkWrite)
             , DocumentHighlight (R 4 6 4 9) (Just HkRead)
@@ -3291,7 +4009,7 @@ highlightTests = testGroup "highlight"
     doc <- createDoc "A.hs" "haskell" source
     _ <- waitForDiagnostics
     highlights <- getHighlights doc (Position 2 8)
-    liftIO $ highlights @?=
+    liftIO $ highlights @?= List
             [ DocumentHighlight (R 2 7 2 10) (Just HkRead)
             , DocumentHighlight (R 3 11 3 14) (Just HkRead)
             ]
@@ -3299,7 +4017,7 @@ highlightTests = testGroup "highlight"
     doc <- createDoc "A.hs" "haskell" source
     _ <- waitForDiagnostics
     highlights <- getHighlights doc (Position 6 5)
-    liftIO $ highlights @?=
+    liftIO $ highlights @?= List
             [ DocumentHighlight (R 6 4 6 7) (Just HkWrite)
             , DocumentHighlight (R 6 10 6 13) (Just HkRead)
             , DocumentHighlight (R 7 12 7 15) (Just HkRead)
@@ -3308,7 +4026,7 @@ highlightTests = testGroup "highlight"
     doc <- createDoc "A.hs" "haskell" recsource
     _ <- waitForDiagnostics
     highlights <- getHighlights doc (Position 4 15)
-    liftIO $ highlights @?=
+    liftIO $ highlights @?= List
       -- Span is just the .. on 8.10, but Rec{..} before
 #if MIN_GHC_API_VERSION(8,10,0)
             [ DocumentHighlight (R 4 8 4 10) (Just HkWrite)
@@ -3318,7 +4036,7 @@ highlightTests = testGroup "highlight"
             , DocumentHighlight (R 4 14 4 20) (Just HkRead)
             ]
     highlights <- getHighlights doc (Position 3 17)
-    liftIO $ highlights @?=
+    liftIO $ highlights @?= List
             [ DocumentHighlight (R 3 17 3 23) (Just HkWrite)
       -- Span is just the .. on 8.10, but Rec{..} before
 #if MIN_GHC_API_VERSION(8,10,0)
@@ -3528,11 +4246,6 @@ pattern R x y x' y' = Range (Position x y) (Position x' y')
 xfail :: TestTree -> String -> TestTree
 xfail = flip expectFailBecause
 
-ignoreTest8101 :: String -> TestTree -> TestTree
-ignoreTest8101
-  | GHC_API_VERSION == ("8.10.1" :: String) = ignoreTestBecause
-  | otherwise = const id
-
 ignoreInWindowsBecause :: String -> TestTree -> TestTree
 ignoreInWindowsBecause = if isWindows then ignoreTestBecause else (\_ x -> x)
 
@@ -3647,13 +4360,13 @@ loadCradleOnlyonce = testGroup "load cradle only once"
         implicit dir = test dir
         test _dir = do
             doc <- createDoc "B.hs" "haskell" "module B where\nimport Data.Foo"
-            msgs <- someTill (skipManyTill anyMessage cradleLoadedMessage) (skipManyTill anyMessage (message @PublishDiagnosticsNotification))
+            msgs <- someTill (skipManyTill anyMessage cradleLoadedMessage) (skipManyTill anyMessage (message STextDocumentPublishDiagnostics))
             liftIO $ length msgs @?= 1
             changeDoc doc [TextDocumentContentChangeEvent Nothing Nothing "module B where\nimport Data.Maybe"]
-            msgs <- manyTill (skipManyTill anyMessage cradleLoadedMessage) (skipManyTill anyMessage (message @PublishDiagnosticsNotification))
+            msgs <- manyTill (skipManyTill anyMessage cradleLoadedMessage) (skipManyTill anyMessage (message STextDocumentPublishDiagnostics))
             liftIO $ length msgs @?= 0
             _ <- createDoc "A.hs" "haskell" "module A where\nimport LoadCradleBar"
-            msgs <- manyTill (skipManyTill anyMessage cradleLoadedMessage) (skipManyTill anyMessage (message @PublishDiagnosticsNotification))
+            msgs <- manyTill (skipManyTill anyMessage cradleLoadedMessage) (skipManyTill anyMessage (message STextDocumentPublishDiagnostics))
             liftIO $ length msgs @?= 0
 
 retryFailedCradle :: TestTree
@@ -3732,7 +4445,7 @@ dependentFileTest = testGroup "addDependentFile"
 
 cradleLoadedMessage :: Session FromServerMessage
 cradleLoadedMessage = satisfy $ \case
-        NotCustomServer (NotificationMessage _ (CustomServerMethod m) _) -> m == cradleLoadedMethod
+        FromServerMess (SCustomMethod m) (NotMess _) -> m == cradleLoadedMethod
         _ -> False
 
 cradleLoadedMethod :: T.Text
@@ -3853,7 +4566,7 @@ ifaceErrorTest = testCase "iface-error-test-1" $ runWithExtraFiles "recomp" $ \d
     -- Change y from Int to B
     changeDoc bdoc [TextDocumentContentChangeEvent Nothing Nothing $ T.unlines ["module B where", "y :: Bool", "y = undefined"]]
     -- save so that we can that the error propogates to A
-    sendNotification TextDocumentDidSave (DidSaveTextDocumentParams bdoc)
+    sendNotification STextDocumentDidSave (DidSaveTextDocumentParams bdoc Nothing)
 
     -- Check that the error propogates to A
     expectDiagnostics
@@ -3861,10 +4574,11 @@ ifaceErrorTest = testCase "iface-error-test-1" $ runWithExtraFiles "recomp" $ \d
 
 
     -- Check that we wrote the interfaces for B when we saved
-    lid <- sendRequest (CustomClientMethod "hidir") $ GetInterfaceFilesDir bPath
-    res <- skipManyTill anyMessage $ responseForId lid
+    let m = SCustomMethod "test"
+    lid <- sendRequest m $ toJSON $ GetInterfaceFilesDir bPath
+    res <- skipManyTill anyMessage $ responseForId m lid
     liftIO $ case res of
-      ResponseMessage{_result=Right hidir} -> do
+      ResponseMessage{_result=Right (A.fromJSON -> A.Success hidir)} -> do
         hi_exists <- doesFileExist $ hidir </> "B.hi"
         assertBool ("Couldn't find B.hi in " ++ hidir) hi_exists
       _ -> assertFailure $ "Got malformed response for CustomMessage hidir: " ++ show res
@@ -4007,6 +4721,8 @@ benchmarkTests =
         assertBool "did not successfully complete 5 repetitions" $ Bench.success res
         | e <- Bench.experiments
         , Bench.name e /= "edit" -- the edit experiment does not ever fail
+        -- the cradle experiments are way too slow
+        , not ("cradle" `isInfixOf` Bench.name e)
     ]
 
 -- | checks if we use InitializeParams.rootUri for loading session
@@ -4028,8 +4744,8 @@ asyncTests = testGroup "async"
     [
       testSession "command" $ do
             -- Execute a command that will block forever
-            let req = ExecuteCommandParams blockCommandId Nothing Nothing
-            void $ sendRequest WorkspaceExecuteCommand req
+            let req = ExecuteCommandParams Nothing blockCommandId Nothing
+            void $ sendRequest SWorkspaceExecuteCommand req
             -- Load a file and check for code actions. Will only work if the command is run asynchronously
             doc <- createDoc "A.hs" "haskell" $ T.unlines
               [ "{-# OPTIONS -Wmissing-signatures #-}"
@@ -4037,10 +4753,13 @@ asyncTests = testGroup "async"
               ]
             void waitForDiagnostics
             actions <- getCodeActions doc (Range (Position 1 0) (Position 1 0))
-            liftIO $ [ _title | CACodeAction CodeAction{_title} <- actions] @=? ["add signature: foo :: a -> a"]
+            liftIO $ [ _title | InR CodeAction{_title} <- actions] @=?
+              [ "add signature: foo :: a -> a"
+              , "Disable \"missing-signatures\" warnings"
+              ]
     , testSession "request" $ do
             -- Execute a custom request that will block for 1000 seconds
-            void $ sendRequest (CustomClientMethod "test") $ BlockSeconds 1000
+            void $ sendRequest (SCustomMethod "test") $ toJSON $ BlockSeconds 1000
             -- Load a file and check for code actions. Will only work if the request is run asynchronously
             doc <- createDoc "A.hs" "haskell" $ T.unlines
               [ "{-# OPTIONS -Wmissing-signatures #-}"
@@ -4048,30 +4767,202 @@ asyncTests = testGroup "async"
               ]
             void waitForDiagnostics
             actions <- getCodeActions doc (Range (Position 0 0) (Position 0 0))
-            liftIO $ [ _title | CACodeAction CodeAction{_title} <- actions] @=? ["add signature: foo :: a -> a"]
+            liftIO $ [ _title | InR CodeAction{_title} <- actions] @=?
+              [ "add signature: foo :: a -> a"
+              , "Disable \"missing-signatures\" warnings"
+              ]
     ]
 
 
 clientSettingsTest :: TestTree
 clientSettingsTest = testGroup "client settings handling"
-    [
-        testSession "ghcide does not support update config" $ do
-            sendNotification WorkspaceDidChangeConfiguration (DidChangeConfigurationParams (toJSON ("" :: String)))
-            logNot <- skipManyTill anyMessage loggingNotification
-            isMessagePresent "Updating Not supported" [getLogMessage logNot]
-    ,   testSession "ghcide restarts shake session on config changes" $ do
-            void $ skipManyTill anyMessage $ message @RegisterCapabilityRequest
-            sendNotification WorkspaceDidChangeConfiguration (DidChangeConfigurationParams (toJSON ("" :: String)))
+    [ testSession "ghcide restarts shake session on config changes" $ do
+            void $ skipManyTill anyMessage $ message SClientRegisterCapability
+            sendNotification SWorkspaceDidChangeConfiguration (DidChangeConfigurationParams (toJSON ("" :: String)))
             nots <- skipManyTill anyMessage $ count 3 loggingNotification
             isMessagePresent "Restarting build session" (map getLogMessage nots)
 
     ]
-  where getLogMessage (NotLogMessage (NotificationMessage _ _ (LogMessageParams _ msg))) = msg
+  where getLogMessage :: FromServerMessage -> T.Text
+        getLogMessage (FromServerMess SWindowLogMessage (NotificationMessage _ _ (LogMessageParams _ msg))) = msg
         getLogMessage _ = ""
 
         isMessagePresent expectedMsg actualMsgs = liftIO $
             assertBool ("\"" ++ expectedMsg ++ "\" is not present in: " ++ show actualMsgs)
                        (any ((expectedMsg `isSubsequenceOf`) . show) actualMsgs)
+
+referenceTests :: TestTree
+referenceTests = testGroup "references"
+    [ testGroup "can get references to FOIs"
+          [ referenceTest "can get references to symbols"
+                          ("References.hs", 4, 7)
+                          YesIncludeDeclaration
+                          [ ("References.hs", 4, 6)
+                          , ("References.hs", 6, 0)
+                          , ("References.hs", 6, 14)
+                          , ("References.hs", 9, 7)
+                          , ("References.hs", 10, 11)
+                          ]
+
+          , referenceTest "can get references to data constructor"
+                          ("References.hs", 13, 2)
+                          YesIncludeDeclaration
+                          [ ("References.hs", 13, 2)
+                          , ("References.hs", 16, 14)
+                          , ("References.hs", 19, 21)
+                          ]
+
+          , referenceTest "getting references works in the other module"
+                          ("OtherModule.hs", 6, 0)
+                          YesIncludeDeclaration
+                          [ ("OtherModule.hs", 6, 0)
+                          , ("OtherModule.hs", 8, 16)
+                          ]
+
+          , referenceTest "getting references works in the Main module"
+                          ("Main.hs", 9, 0)
+                          YesIncludeDeclaration
+                          [ ("Main.hs", 9, 0)
+                          , ("Main.hs", 10, 4)
+                          ]
+
+          , referenceTest "getting references to main works"
+                          ("Main.hs", 5, 0)
+                          YesIncludeDeclaration
+                          [ ("Main.hs", 4, 0)
+                          , ("Main.hs", 5, 0)
+                          ]
+
+          , referenceTest "can get type references"
+                          ("Main.hs", 9, 9)
+                          YesIncludeDeclaration
+                          [ ("Main.hs", 9, 0)
+                          , ("Main.hs", 9, 9)
+                          , ("Main.hs", 10, 0)
+                          ]
+
+          , expectFailBecause "references provider does not respect includeDeclaration parameter" $
+ referenceTest "works when we ask to exclude declarations"
+                          ("References.hs", 4, 7)
+                          NoExcludeDeclaration
+                          [ ("References.hs", 6, 0)
+                          , ("References.hs", 6, 14)
+                          , ("References.hs", 9, 7)
+                          , ("References.hs", 10, 11)
+                          ]
+
+          , referenceTest "INCORRECTLY returns declarations when we ask to exclude them"
+                          ("References.hs", 4, 7)
+                          NoExcludeDeclaration
+                          [ ("References.hs", 4, 6)
+                          , ("References.hs", 6, 0)
+                          , ("References.hs", 6, 14)
+                          , ("References.hs", 9, 7)
+                          , ("References.hs", 10, 11)
+                          ]
+          ]
+
+    , testGroup "can get references to non FOIs"
+          [ referenceTest "can get references to symbol defined in a module we import"
+                          ("References.hs", 22, 4)
+                          YesIncludeDeclaration
+                          [ ("References.hs", 22, 4)
+                          , ("OtherModule.hs", 0, 20)
+                          , ("OtherModule.hs", 4, 0)
+                          ]
+
+          , referenceTest "can get references in modules that import us to symbols we define"
+                          ("OtherModule.hs", 4, 0)
+                          YesIncludeDeclaration
+                          [ ("References.hs", 22, 4)
+                          , ("OtherModule.hs", 0, 20)
+                          , ("OtherModule.hs", 4, 0)
+                          ]
+
+          , referenceTest "can get references to symbol defined in a module we import transitively"
+                          ("References.hs", 24, 4)
+                          YesIncludeDeclaration
+                          [ ("References.hs", 24, 4)
+                          , ("OtherModule.hs", 0, 48)
+                          , ("OtherOtherModule.hs", 2, 0)
+                          ]
+
+          , referenceTest "can get references in modules that import us transitively to symbols we define"
+                          ("OtherOtherModule.hs", 2, 0)
+                          YesIncludeDeclaration
+                          [ ("References.hs", 24, 4)
+                          , ("OtherModule.hs", 0, 48)
+                          , ("OtherOtherModule.hs", 2, 0)
+                          ]
+
+          , referenceTest "can get type references to other modules"
+                          ("Main.hs", 12, 10)
+                          YesIncludeDeclaration
+                          [ ("Main.hs", 12, 7)
+                          , ("Main.hs", 13, 0)
+                          , ("References.hs", 12, 5)
+                          , ("References.hs", 16, 0)
+                          ]
+          ]
+    ]
+
+-- | When we ask for all references to symbol "foo", should the declaration "foo
+-- = 2" be among the references returned?
+data IncludeDeclaration =
+    YesIncludeDeclaration
+    | NoExcludeDeclaration
+
+getReferences' :: SymbolLocation -> IncludeDeclaration -> Session (List Location)
+getReferences' (file, l, c) includeDeclaration = do
+    doc <- openDoc file "haskell"
+    getReferences doc (Position l c) $ toBool includeDeclaration
+    where toBool YesIncludeDeclaration = True
+          toBool NoExcludeDeclaration = False
+
+referenceTestSession :: String -> FilePath -> [FilePath] -> (FilePath -> Session ()) -> TestTree
+referenceTestSession name thisDoc docs' f = testSessionWithExtraFiles "references" name $ \dir -> do
+  let docs = map (dir </>) $ delete thisDoc $ nubOrd docs'
+  -- Initial Index
+  docid <- openDoc thisDoc "haskell"
+  let
+    loop :: [FilePath] -> Session ()
+    loop [] = pure ()
+    loop docs = do
+      doc <- skipManyTill anyMessage $ satisfyMaybe $ \case
+          FromServerMess (SCustomMethod "ghcide/reference/ready") (NotMess NotificationMessage{_params = fp}) -> do
+            A.Success fp' <- pure $ fromJSON fp
+            find (fp' ==) docs
+          _ -> Nothing
+      loop (delete doc docs)
+  loop docs
+  f dir
+  closeDoc docid
+
+-- | Given a location, lookup the symbol and all references to it. Make sure
+-- they are the ones we expect.
+referenceTest :: String -> SymbolLocation -> IncludeDeclaration -> [SymbolLocation] -> TestTree
+referenceTest name loc includeDeclaration expected =
+    referenceTestSession name (fst3 loc) docs $ \dir -> do
+        List actual <- getReferences' loc includeDeclaration
+        liftIO $ actual `expectSameLocations` map (first3 (dir </>)) expected
+  where
+    docs = map fst3 expected
+
+type SymbolLocation = (FilePath, Int, Int)
+
+expectSameLocations :: [Location] -> [SymbolLocation] -> Assertion
+expectSameLocations actual expected = do
+    let actual' =
+            Set.map (\location -> (location ^. L.uri
+                                   , location ^. L.range . L.start . L.line
+                                   , location ^. L.range . L.start . L.character))
+            $ Set.fromList actual
+    expected' <- Set.fromList <$>
+        (forM expected $ \(file, l, c) -> do
+                              fp <- canonicalizePath file
+                              return (filePathToUri fp, l, c))
+    actual' @?= expected'
+
 ----------------------------------------------------------------------
 -- Utils
 ----------------------------------------------------------------------
@@ -4095,18 +4986,18 @@ testSessionWait name = testSession name .
       -- Experimentally, 0.5s seems to be long enough to wait for any final diagnostics to appear.
       ( >> expectNoMoreDiagnostics 0.5)
 
-pickActionWithTitle :: T.Text -> [CAResult] -> IO CodeAction
+pickActionWithTitle :: T.Text -> [Command |? CodeAction] -> IO CodeAction
 pickActionWithTitle title actions = do
   assertBool ("Found no matching actions for " <> show title <> " in " <> show titles) (not $ null matches)
   return $ head matches
   where
     titles =
         [ actionTitle
-        | CACodeAction CodeAction { _title = actionTitle } <- actions
+        | InR CodeAction { _title = actionTitle } <- actions
         ]
     matches =
         [ action
-        | CACodeAction action@CodeAction { _title = actionTitle } <- actions
+        | InR action@CodeAction { _title = actionTitle } <- actions
         , title == actionTitle
         ]
 
@@ -4188,12 +5079,12 @@ findCodeActions' op errMsg doc range expectedTitles = do
   let matches = sequence
         [ listToMaybe
           [ action
-          | CACodeAction action@CodeAction { _title = actionTitle } <- actions
+          | InR action@CodeAction { _title = actionTitle } <- actions
           , expectedTitle `op` actionTitle]
         | expectedTitle <- expectedTitles]
   let msg = show
             [ actionTitle
-            | CACodeAction CodeAction { _title = actionTitle } <- actions
+            | InR CodeAction { _title = actionTitle } <- actions
             ]
             ++ " " <> errMsg <> " "
             ++ show expectedTitles
@@ -4409,13 +5300,13 @@ nthLine i r
     | i >= Rope.rows r = error $ "Row number out of bounds: " <> show i <> "/" <> show (Rope.rows r)
     | otherwise = Rope.takeWhile (/= '\n') $ fst $ Rope.splitAtLine 1 $ snd $ Rope.splitAtLine (i - 1) r
 
-getWatchedFilesSubscriptionsUntil :: forall end . (FromJSON end, Typeable end) => Session [Maybe Value]
-getWatchedFilesSubscriptionsUntil = do
-      msgs <- manyTill (Just <$> message @RegisterCapabilityRequest <|> Nothing <$ anyMessage) (message @end)
+getWatchedFilesSubscriptionsUntil :: forall m. SServerMethod m -> Session [DidChangeWatchedFilesRegistrationOptions]
+getWatchedFilesSubscriptionsUntil m = do
+      msgs <- manyTill (Just <$> message SClientRegisterCapability <|> Nothing <$ anyMessage) (message m)
       return
             [ args
             | Just RequestMessage{_params = RegistrationParams (List regs)} <- msgs
-            , Registration _id WorkspaceDidChangeWatchedFiles args <- regs
+            , SomeRegistration (Registration _id SWorkspaceDidChangeWatchedFiles args) <- regs
             ]
 
 -- | Version of 'System.IO.Extra.withTempDir' that canonicalizes the path
@@ -4425,3 +5316,9 @@ withTempDir :: (FilePath -> IO a) -> IO a
 withTempDir f = System.IO.Extra.withTempDir $ \dir -> do
   dir' <- canonicalizePath dir
   f dir'
+
+-- | Assert that a value is not 'Nothing', and extract the value.
+assertJust :: MonadIO m => String -> Maybe a -> m a
+assertJust s = \case
+  Nothing -> liftIO $ assertFailure s
+  Just x -> pure x

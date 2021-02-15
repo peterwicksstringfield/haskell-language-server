@@ -7,6 +7,7 @@
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE ConstraintKinds            #-}
+{-# LANGUAGE PolyKinds #-}
 
 -- | A Shake implementation of the compiler service.
 --
@@ -36,8 +37,10 @@ module Development.IDE.Core.Shake(
     use_, useNoFile_, uses_,
     useWithStale, usesWithStale,
     useWithStale_, usesWithStale_,
+    BadDependency(..),
     define, defineEarlyCutoff, defineOnDisk, needOnDisk, needOnDisks,
     getDiagnostics,
+    mRunLspT, mRunLspTCallback,
     getHiddenDiagnostics,
     IsIdeGlobal, addIdeGlobal, addIdeGlobalExtras, getIdeGlobalState, getIdeGlobalAction,
     getIdeGlobalExtras,
@@ -47,7 +50,6 @@ module Development.IDE.Core.Shake(
     garbageCollect,
     knownTargets,
     setPriority,
-    sendEvent,
     ideLogger,
     actionLogger,
     FileVersion(..),
@@ -62,6 +64,11 @@ module Development.IDE.Core.Shake(
     mkUpdater,
     -- Exposed for testing.
     Q(..),
+    IndexQueue,
+    HieDb,
+    HieDbWriter(..),
+    VFSHandle(..),
+    addPersistentRule
     ) where
 
 import           Development.Shake hiding (ShakeValue, doesFileExist, Info)
@@ -91,7 +98,7 @@ import Development.IDE.Types.Logger hiding (Priority)
 import Development.IDE.Types.KnownTargets
 import Development.IDE.Types.Shake
 import qualified Development.IDE.Types.Logger as Logger
-import Language.Haskell.LSP.Diagnostics
+import Language.LSP.Diagnostics
 import qualified Data.SortedList as SL
 import           Development.IDE.Types.Diagnostics
 import Development.IDE.Types.Exports
@@ -99,21 +106,19 @@ import Development.IDE.Types.Location
 import Development.IDE.Types.Options
 import           Control.Concurrent.Async
 import           Control.Concurrent.Extra
-import           Control.Concurrent.STM (readTVar, writeTVar, newTVarIO, atomically)
+import           Control.Concurrent.STM
 import           Control.DeepSeq
-import           Control.Exception.Extra
 import           System.Time.Extra
 import           Data.Typeable
-import qualified Language.Haskell.LSP.Core as LSP
-import qualified Language.Haskell.LSP.Messages as LSP
-import qualified Language.Haskell.LSP.Types as LSP
+import qualified Language.LSP.Server as LSP
+import qualified Language.LSP.Types as LSP
 import           System.FilePath hiding (makeRelative)
 import qualified Development.Shake as Shake
 import           Control.Monad.Extra
 import           Data.Time
 import           GHC.Generics
 import           System.IO.Unsafe
-import Language.Haskell.LSP.Types
+import Language.LSP.Types
 import qualified Control.Monad.STM as STM
 import Control.Monad.IO.Class
 import Control.Monad.Reader
@@ -121,17 +126,41 @@ import Control.Monad.Trans.Maybe
 import Data.Traversable
 import Data.Hashable
 import Development.IDE.Core.Tracing
+import Language.LSP.VFS
 
 import Data.IORef
 import NameCache
 import UniqSupply
 import PrelInfo
-import Language.Haskell.LSP.Types.Capabilities
+import Language.LSP.Types.Capabilities
 import OpenTelemetry.Eventlog
+import GHC.Fingerprint
+
+import HieDb.Types
+import           Control.Exception.Extra hiding (bracket_)
+import UnliftIO.Exception (bracket_)
+import           Ide.Plugin.Config
+import Data.Default
+
+-- | We need to serialize writes to the database, so we send any function that
+-- needs to write to the database over the channel, where it will be picked up by
+-- a worker thread.
+data HieDbWriter
+  = HieDbWriter
+  { indexQueue :: IndexQueue
+  , indexPending :: TVar (HMap.HashMap NormalizedFilePath Fingerprint) -- ^ Avoid unnecessary/out of date indexing
+  , indexCompleted :: TVar Int -- ^ to report progress
+  , indexProgressToken :: Var (Maybe LSP.ProgressToken)
+  -- ^ This is a Var instead of a TVar since we need to do IO to initialise/update, so we need a lock
+  }
+
+-- | Actions to queue up on the index worker thread
+type IndexQueue = TQueue (HieDb -> IO ())
 
 -- information we stash inside the shakeExtra field
 data ShakeExtras = ShakeExtras
-    {eventer :: LSP.FromServerMessage -> IO ()
+    { --eventer :: LSP.FromServerMessage -> IO ()
+     lspEnv :: Maybe (LSP.LanguageContextEnv Config)
     ,debouncer :: Debouncer NormalizedUri
     ,logger :: Logger
     ,globals :: Var (HMap.HashMap TypeRep Dynamic)
@@ -149,15 +178,10 @@ data ShakeExtras = ShakeExtras
     ,inProgress :: Var (HMap.HashMap NormalizedFilePath Int)
     -- ^ How many rules are running for each file
     ,progressUpdate :: ProgressEvent -> IO ()
-    -- ^ The generator for unique Lsp identifiers
     ,ideTesting :: IdeTesting
     -- ^ Whether to enable additional lsp messages used by the test suite for checking invariants
     ,session :: MVar ShakeSession
     -- ^ Used in the GhcSession rule to forcefully restart the session after adding a new component
-    ,withProgress           :: WithProgressFunc
-    -- ^ Report progress about some long running operation (on top of the progress shown by 'lspShakeProgress')
-    ,withIndefiniteProgress :: WithIndefiniteProgressFunc
-    -- ^ Same as 'withProgress', but for processes that do not report the percentage complete
     ,restartShakeSession :: [DelayedAction ()] -> IO ()
     ,ideNc :: IORef NameCache
     -- | A mapping of module name to known target (or candidate targets, if missing)
@@ -167,16 +191,24 @@ data ShakeExtras = ShakeExtras
     -- | A work queue for actions added via 'runInShakeSession'
     ,actionQueue :: ActionQueue
     ,clientCapabilities :: ClientCapabilities
+    , hiedb :: HieDb -- ^ Use only to read.
+    , hiedbWriter :: HieDbWriter -- ^ use to write
+    , persistentKeys :: Var (HMap.HashMap Key GetStalePersistent)
+      -- ^ Registery for functions that compute/get "stale" results for the rule
+      -- (possibly from disk)
+    , vfs :: VFSHandle
     }
 
 type WithProgressFunc = forall a.
-    T.Text -> LSP.ProgressCancellable -> ((LSP.Progress -> IO ()) -> IO a) -> IO a
+    T.Text -> LSP.ProgressCancellable -> ((LSP.ProgressAmount -> IO ()) -> IO a) -> IO a
 type WithIndefiniteProgressFunc = forall a.
     T.Text -> LSP.ProgressCancellable -> IO a -> IO a
 
 data ProgressEvent
     = KickStarted
     | KickCompleted
+
+type GetStalePersistent = NormalizedFilePath -> IdeAction (Maybe (Dynamic,PositionDelta,TextDocumentVersion))
 
 getShakeExtras :: Action ShakeExtras
 getShakeExtras = do
@@ -188,7 +220,31 @@ getShakeExtrasRules = do
     Just x <- getShakeExtraRules @ShakeExtras
     return x
 
+-- | Register a function that will be called to get the "stale" result of a rule, possibly from disk
+-- This is called when we don't already have a result, or computing the rule failed.
+-- The result of this function will always be marked as 'stale', and a 'proper' rebuild of the rule will
+-- be queued if the rule hasn't run before.
+addPersistentRule :: IdeRule k v => k -> (NormalizedFilePath -> IdeAction (Maybe (v,PositionDelta,TextDocumentVersion))) -> Rules ()
+addPersistentRule k getVal = do
+  ShakeExtras{persistentKeys} <- getShakeExtrasRules
+  liftIO $ modifyVar_ persistentKeys $ \hm -> do
+    pure $ HMap.insert (Key k) (fmap (fmap (first3 toDyn)) . getVal) hm
+  return ()
+
 class Typeable a => IsIdeGlobal a where
+
+
+-- | haskell-lsp manages the VFS internally and automatically so we cannot use
+-- the builtin VFS without spawning up an LSP server. To be able to test things
+-- like `setBufferModified` we abstract over the VFS implementation.
+data VFSHandle = VFSHandle
+    { getVirtualFile :: NormalizedUri -> IO (Maybe VirtualFile)
+        -- ^ get the contents of a virtual file
+    , setVirtualFileContents :: Maybe (NormalizedUri -> Maybe T.Text -> IO ())
+        -- ^ set a specific file to a value. If Nothing then we are ignoring these
+        --   signals anyway so can just say something was modified
+    }
+instance IsIdeGlobal VFSHandle
 
 addIdeGlobal :: IsIdeGlobal a => a -> Rules ()
 addIdeGlobal x = do
@@ -234,26 +290,54 @@ getIdeOptionsIO ide = do
 
 -- | Return the most recent, potentially stale, value and a PositionMapping
 -- for the version of that value.
-lastValueIO :: ShakeExtras -> NormalizedFilePath -> Value v -> IO (Maybe (v, PositionMapping))
-lastValueIO ShakeExtras{positionMapping} file v = do
-    allMappings <- liftIO $ readVar positionMapping
-    pure $ case v of
-        Succeeded ver v -> Just (v, mappingForVersion allMappings file ver)
-        Stale ver v -> Just (v, mappingForVersion allMappings file ver)
-        Failed -> Nothing
+lastValueIO :: IdeRule k v => ShakeExtras -> k -> NormalizedFilePath -> IO (Maybe (v, PositionMapping))
+lastValueIO s@ShakeExtras{positionMapping,persistentKeys,state} k file = do
+    hm <- readVar state
+    allMappings <- readVar positionMapping
+
+    let readPersistent
+          | IdeTesting testing <- ideTesting s -- Don't read stale persistent values in tests
+          , testing = pure Nothing
+          | otherwise = do
+          pmap <- readVar persistentKeys
+          mv <- runMaybeT $ do
+            liftIO $ Logger.logDebug (logger s) $ T.pack $ "LOOKUP UP PERSISTENT FOR: " ++ show k
+            f <- MaybeT $ pure $ HMap.lookup (Key k) pmap
+            (dv,del,ver) <- MaybeT $ runIdeAction "lastValueIO" s $ f file
+            MaybeT $ pure $ (,del,ver) <$> fromDynamic dv
+          modifyVar state $ \hm -> pure $ case mv of
+            Nothing -> (HMap.alter (alterValue $ Failed True) (file,Key k) hm,Nothing)
+            Just (v,del,ver) -> (HMap.alter (alterValue $ Stale (Just del) ver (toDyn v)) (file,Key k) hm
+                                ,Just (v,addDelta del $ mappingForVersion allMappings file ver))
+
+        -- We got a new stale value from the persistent rule, insert it in the map without affecting diagnostics
+        alterValue new Nothing = Just (ValueWithDiagnostics new mempty) -- If it wasn't in the map, give it empty diagnostics
+        alterValue new (Just old@(ValueWithDiagnostics val diags)) = Just $ case val of
+          -- Old failed, we can update it preserving diagnostics
+          Failed{} -> ValueWithDiagnostics new diags
+          -- Something already succeeded before, leave it alone
+          _ -> old
+
+    case HMap.lookup (file,Key k) hm of
+      Nothing -> readPersistent
+      Just (ValueWithDiagnostics v _) -> case v of
+        Succeeded ver (fromDynamic -> Just v) -> pure (Just (v, mappingForVersion allMappings file ver))
+        Stale del ver (fromDynamic -> Just v) -> pure (Just (v, maybe id addDelta del $ mappingForVersion allMappings file ver))
+        Failed p | not p -> readPersistent
+        _ -> pure Nothing
 
 -- | Return the most recent, potentially stale, value and a PositionMapping
 -- for the version of that value.
-lastValue :: NormalizedFilePath -> Value v -> Action (Maybe (v, PositionMapping))
-lastValue file v = do
+lastValue :: IdeRule k v => k -> NormalizedFilePath -> Action (Maybe (v, PositionMapping))
+lastValue key file = do
     s <- getShakeExtras
-    liftIO $ lastValueIO s file v
+    liftIO $ lastValueIO s key file
 
 valueVersion :: Value v -> Maybe TextDocumentVersion
 valueVersion = \case
     Succeeded ver _ -> Just ver
-    Stale ver _ -> Just ver
-    Failed -> Nothing
+    Stale _ ver _ -> Just ver
+    Failed _ -> Nothing
 
 mappingForVersion
     :: HMap.HashMap NormalizedUri (Map TextDocumentVersion (a, PositionMapping))
@@ -362,25 +446,24 @@ knownTargets = do
 seqValue :: Value v -> b -> b
 seqValue v b = case v of
     Succeeded ver v -> rnf ver `seq` v `seq` b
-    Stale ver v -> rnf ver `seq` v `seq` b
-    Failed -> b
+    Stale d ver v -> rnf d `seq` rnf ver `seq` v `seq` b
+    Failed _ -> b
 
 -- | Open a 'IdeState', should be shut using 'shakeShut'.
-shakeOpen :: IO LSP.LspId
-          -> (LSP.FromServerMessage -> IO ()) -- ^ diagnostic handler
-          -> WithProgressFunc
-          -> WithIndefiniteProgressFunc
-          -> ClientCapabilities
+shakeOpen :: Maybe (LSP.LanguageContextEnv Config)
           -> Logger
           -> Debouncer NormalizedUri
           -> Maybe FilePath
           -> IdeReportProgress
           -> IdeTesting
+          -> HieDb
+          -> IndexQueue
+          -> VFSHandle
           -> ShakeOptions
           -> Rules ()
           -> IO IdeState
-shakeOpen getLspId eventer withProgress withIndefiniteProgress clientCapabilities logger debouncer
-  shakeProfileDir (IdeReportProgress reportProgress) ideTesting@(IdeTesting testing) opts rules = mdo
+shakeOpen lspEnv logger debouncer
+  shakeProfileDir (IdeReportProgress reportProgress) ideTesting@(IdeTesting testing) hiedb indexQueue vfs opts rules = mdo
 
     inProgress <- newVar HMap.empty
     us <- mkSplitUniqSupply 'r'
@@ -396,13 +479,20 @@ shakeOpen getLspId eventer withProgress withIndefiniteProgress clientCapabilitie
         let restartShakeSession = shakeRestart ideState
         let session = shakeSession
         mostRecentProgressEvent <- newTVarIO KickCompleted
+        persistentKeys <- newVar HMap.empty
         let progressUpdate = atomically . writeTVar mostRecentProgressEvent
+        indexPending <- newTVarIO HMap.empty
+        indexCompleted <- newTVarIO 0
+        indexProgressToken <- newVar Nothing
+        let hiedbWriter = HieDbWriter{..}
         progressAsync <- async $
             when reportProgress $
                 progressThread mostRecentProgressEvent inProgress
         exportsMap <- newVar mempty
 
         actionQueue <- newQueue
+
+        let clientCapabilities = maybe def LSP.resClientCapabilities lspEnv
 
         pure (ShakeExtras{..}, cancel progressAsync)
     (shakeDbM, shakeClose) <-
@@ -433,7 +523,7 @@ shakeOpen getLspId eventer withProgress withIndefiniteProgress clientCapabilitie
                     case v of
                         KickCompleted -> STM.retry
                         KickStarted -> return ()
-                asyncReporter <- async lspShakeProgress
+                asyncReporter <- async $ mRunLspT lspEnv lspShakeProgress
                 progressLoopReporting asyncReporter
             progressLoopReporting asyncReporter = do
                 atomically $ do
@@ -444,54 +534,55 @@ shakeOpen getLspId eventer withProgress withIndefiniteProgress clientCapabilitie
                 cancel asyncReporter
                 progressLoopIdle
 
+            lspShakeProgress :: LSP.LspM config ()
             lspShakeProgress = do
                 -- first sleep a bit, so we only show progress messages if it's going to take
                 -- a "noticable amount of time" (we often expect a thread kill to arrive before the sleep finishes)
-                unless testing $ sleep 0.1
-                lspId <- getLspId
-                u <- ProgressTextToken . T.pack . show . hashUnique <$> newUnique
-                eventer $ LSP.ReqWorkDoneProgressCreate $
-                  LSP.fmServerWorkDoneProgressCreateRequest lspId $
-                    LSP.WorkDoneProgressCreateParams { _token = u }
-                bracket_ (start u) (stop u) (loop u Nothing)
+                liftIO $ unless testing $ sleep 0.1
+                u <- ProgressTextToken . T.pack . show . hashUnique <$> liftIO newUnique
+
+                void $ LSP.sendRequest LSP.SWindowWorkDoneProgressCreate
+                    LSP.WorkDoneProgressCreateParams { _token = u } $ const (pure ())
+
+                bracket_
+                  (start u)
+                  (stop u)
+                  (loop u Nothing)
                 where
-                    start id = eventer $ LSP.NotWorkDoneProgressBegin $
-                      LSP.fmServerWorkDoneProgressBeginNotification
+                    start id = LSP.sendNotification LSP.SProgress $
                         LSP.ProgressParams
                             { _token = id
-                            , _value = WorkDoneProgressBeginParams
+                            , _value = LSP.Begin $ WorkDoneProgressBeginParams
                               { _title = "Processing"
                               , _cancellable = Nothing
                               , _message = Nothing
                               , _percentage = Nothing
                               }
                             }
-                    stop id = eventer $ LSP.NotWorkDoneProgressEnd $
-                      LSP.fmServerWorkDoneProgressEndNotification
+                    stop id = LSP.sendNotification LSP.SProgress
                         LSP.ProgressParams
                             { _token = id
-                            , _value = WorkDoneProgressEndParams
+                            , _value = LSP.End WorkDoneProgressEndParams
                               { _message = Nothing
                               }
                             }
                     sample = 0.1
                     loop id prev = do
-                        sleep sample
-                        current <- readVar inProgress
+                        liftIO $ sleep sample
+                        current <- liftIO $ readVar inProgress
                         let done = length $ filter (== 0) $ HMap.elems current
                         let todo = HMap.size current
                         let next = Just $ T.pack $ show done <> "/" <> show todo
                         when (next /= prev) $
-                            eventer $ LSP.NotWorkDoneProgressReport $
-                              LSP.fmServerWorkDoneProgressReportNotification
-                                LSP.ProgressParams
-                                    { _token = id
-                                    , _value = LSP.WorkDoneProgressReportParams
-                                    { _cancellable = Nothing
-                                    , _message = next
-                                    , _percentage = Nothing
-                                    }
-                                    }
+                          LSP.sendNotification LSP.SProgress $
+                          LSP.ProgressParams
+                              { _token = id
+                              , _value = LSP.Report $ LSP.WorkDoneProgressReportParams
+                                { _cancellable = Nothing
+                                , _message = next
+                                , _percentage = Nothing
+                                }
+                              }
                         loop id next
 
 shakeProfile :: IdeState -> FilePath -> IO ()
@@ -555,9 +646,8 @@ shakeRestart IdeState{..} acts =
 notifyTestingLogMessage :: ShakeExtras -> T.Text -> IO ()
 notifyTestingLogMessage extras msg = do
     (IdeTesting isTestMode) <- optTesting <$> getIdeOptionsIO extras
-    let notif = LSP.NotLogMessage $ LSP.NotificationMessage "2.0" LSP.WindowLogMessage
-                                  $ LSP.LogMessageParams LSP.MtLog msg
-    when isTestMode $ eventer extras notif
+    let notif = LSP.LogMessageParams LSP.MtLog msg
+    when isTestMode $ mRunLspT (lspEnv extras) $ LSP.sendNotification LSP.SWindowLogMessage notif
 
 
 -- | Enqueue an action in the existing 'ShakeSession'.
@@ -649,6 +739,18 @@ instantiateDelayedAction (DelayedAction _ s p a) = do
       d' = DelayedAction (Just u) s p a'
   return (b, d')
 
+mRunLspT :: Applicative m => Maybe (LSP.LanguageContextEnv c ) -> LSP.LspT c m () -> m ()
+mRunLspT (Just lspEnv) f = LSP.runLspT lspEnv f
+mRunLspT Nothing _ = pure ()
+
+mRunLspTCallback :: Monad m
+                 => Maybe (LSP.LanguageContextEnv c)
+                 -> (LSP.LspT c m a -> LSP.LspT c m a)
+                 -> m a
+                 -> m a
+mRunLspTCallback (Just lspEnv) f g = LSP.runLspT lspEnv $ f (lift g)
+mRunLspTCallback Nothing _ g = g
+
 getDiagnostics :: IdeState -> IO [FileDiagnostic]
 getDiagnostics IdeState{shakeExtras = ShakeExtras{diagnostics}} = do
     val <- readVar diagnostics
@@ -718,10 +820,8 @@ runIdeAction _herald s i = runReaderT (runIdeActionT i) s
 askShake :: IdeAction ShakeExtras
 askShake = ask
 
-mkUpdater :: MaybeT IdeAction NameCacheUpdater
-mkUpdater = do
-  ref <- lift $ ideNc <$> askShake
-  pure $ NCU (upNameCache ref)
+mkUpdater :: IORef NameCache -> NameCacheUpdater
+mkUpdater ref = NCU (upNameCache ref)
 
 -- | A (maybe) stale result now, and an up to date one later
 data FastResult a = FastResult { stale :: Maybe (a,PositionMapping), uptoDate :: IO (Maybe a)  }
@@ -748,16 +848,16 @@ useWithStaleFast' key file = do
   liftIO $ case r of
     -- block for the result if we haven't computed before
     Nothing -> do
-      a <- wait
-      r <- getValues state key file
-      case r of
-        Nothing -> return $ FastResult Nothing (pure a)
-        Just (v, _) -> do
-          res <- lastValueIO s file v
-          pure $ FastResult res (pure a)
+      -- Check if we can get a stale value from disk
+      res <- lastValueIO s key file
+      case res of
+        Nothing -> do
+          a <- wait
+          pure $ FastResult ((,zeroMapping) <$> a) (pure a)
+        Just _ -> pure $ FastResult res wait
     -- Otherwise, use the computed value even if it's out of date.
-    Just (v, _) -> do
-      res <- lastValueIO s file v
+    Just _ -> do
+      res <- lastValueIO s key file
       pure $ FastResult res wait
 
 useNoFile :: IdeRule k v => k -> Action (Maybe v)
@@ -785,8 +885,11 @@ uses key files = map (\(A value) -> currentValue value) <$> apply (map (Q . (key
 usesWithStale :: IdeRule k v
     => k -> [NormalizedFilePath] -> Action [Maybe (v, PositionMapping)]
 usesWithStale key files = do
-    values <- map (\(A value) -> value) <$> apply (map (Q . (key,)) files)
-    zipWithM lastValue files values
+    _ <- apply (map (Q . (key,)) files)
+    -- We don't look at the result of the 'apply' since 'lastValue' will
+    -- return the most recent successfully computed value regardless of
+    -- whether the rule succeeded or not.
+    mapM (lastValue key) files
 
 -- | Define a new Rule with early cutoff
 defineEarlyCutoff
@@ -819,14 +922,14 @@ defineEarlyCutoff op = addBuiltinRule noLint noIdentity $ \(Q (key, file)) (old 
                     Nothing -> do
                         staleV <- liftIO $ getValues state key file
                         pure $ case staleV of
-                            Nothing -> (toShakeValue ShakeResult bs, Failed)
+                            Nothing -> (toShakeValue ShakeResult bs, Failed False)
                             Just v -> case v of
                                 (Succeeded ver v, _) ->
-                                    (toShakeValue ShakeStale bs, Stale ver v)
-                                (Stale ver v, _) ->
-                                    (toShakeValue ShakeStale bs, Stale ver v)
-                                (Failed, _) ->
-                                    (toShakeValue ShakeResult bs, Failed)
+                                    (toShakeValue ShakeStale bs, Stale Nothing ver v)
+                                (Stale d ver v, _) ->
+                                    (toShakeValue ShakeStale bs, Stale d ver v)
+                                (Failed b, _) ->
+                                    (toShakeValue ShakeResult bs, Failed b)
                     Just v -> pure (maybe ShakeNoCutoff ShakeResult bs, Succeeded (vfsVersion =<< modTime) v)
                 liftIO $ setValues state key file res (Vector.fromList diags)
                 updateFileDiagnostics file (Key key) extras $ map (\(_,y,z) -> (y,z)) diags
@@ -849,7 +952,7 @@ defineEarlyCutoff op = addBuiltinRule noLint noIdentity $ \(Q (key, file)) (old 
         where f shift = modifyVar_ var $ \x -> evaluate $ HMap.insertWith (\_ x -> shift x) file (shift 0) x
 
 isSuccess :: RunResult (A v) -> Bool
-isSuccess (RunResult _ _ (A Failed)) = False
+isSuccess (RunResult _ _ (A Failed{})) = False
 isSuccess _ = True
 
 -- | Rule type, input file
@@ -933,7 +1036,7 @@ updateFileDiagnostics :: MonadIO m
   -> ShakeExtras
   -> [(ShowDiagnostic,Diagnostic)] -- ^ current results
   -> m ()
-updateFileDiagnostics fp k ShakeExtras{diagnostics, hiddenDiagnostics, publishedDiagnostics, state, debouncer, eventer} current = liftIO $ do
+updateFileDiagnostics fp k ShakeExtras{logger, diagnostics, hiddenDiagnostics, publishedDiagnostics, state, debouncer, lspEnv} current = liftIO $ do
     modTime <- (currentValue . fst =<<) <$> getValues state GetModificationTime fp
     let (currentShown, currentHidden) = partition ((== ShowDiag) . fst) current
         uri = filePathToUri' fp
@@ -954,25 +1057,18 @@ updateFileDiagnostics fp k ShakeExtras{diagnostics, hiddenDiagnostics, published
         registerEvent debouncer delay uri $ do
              mask_ $ modifyVar_ publishedDiagnostics $ \published -> do
                  let lastPublish = HMap.lookupDefault [] uri published
-                 when (lastPublish /= newDiags) $
-                     eventer $ publishDiagnosticsNotification (fromNormalizedUri uri) newDiags
+                 when (lastPublish /= newDiags) $ case lspEnv of
+                   Nothing -> -- Print an LSP event.
+                     logInfo logger $ showDiagnosticsColored $ map (fp,ShowDiag,) newDiags
+                   Just env -> LSP.runLspT env $
+                     LSP.sendNotification LSP.STextDocumentPublishDiagnostics $
+                       LSP.PublishDiagnosticsParams (fromNormalizedUri uri) ver (List newDiags)
                  pure $! HMap.insert uri newDiags published
-
-publishDiagnosticsNotification :: Uri -> [Diagnostic] -> LSP.FromServerMessage
-publishDiagnosticsNotification uri diags =
-    LSP.NotPublishDiagnostics $
-    LSP.NotificationMessage "2.0" LSP.TextDocumentPublishDiagnostics $
-    LSP.PublishDiagnosticsParams uri (List diags)
 
 newtype Priority = Priority Double
 
 setPriority :: Priority -> Action ()
 setPriority (Priority p) = reschedule p
-
-sendEvent :: LSP.FromServerMessage -> Action ()
-sendEvent e = do
-    ShakeExtras{eventer} <- getShakeExtras
-    liftIO $ eventer e
 
 ideLogger :: IdeState -> Logger
 ideLogger IdeState{shakeExtras=ShakeExtras{logger}} = logger

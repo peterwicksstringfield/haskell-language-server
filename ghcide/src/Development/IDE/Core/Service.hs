@@ -20,53 +20,49 @@ module Development.IDE.Core.Service(
 
 import Development.IDE.Types.Options (IdeOptions(..))
 import Development.IDE.Core.Debouncer
-import           Development.IDE.Core.FileStore  (VFSHandle, fileStoreRules)
+import           Development.IDE.Core.FileStore  (fileStoreRules)
 import           Development.IDE.Core.FileExists (fileExistsRules)
 import           Development.IDE.Core.OfInterest
 import Development.IDE.Types.Logger as Logger
 import           Development.Shake
-import qualified Language.Haskell.LSP.Messages as LSP
-import qualified Language.Haskell.LSP.Types as LSP
-import qualified Language.Haskell.LSP.Types.Capabilities as LSP
+import qualified Language.LSP.Server as LSP
+import qualified Language.LSP.Types as LSP
+import           Ide.Plugin.Config
 
 import           Development.IDE.Core.Shake
 import Control.Monad
-
 
 
 ------------------------------------------------------------
 -- Exposed API
 
 -- | Initialise the Compiler Service.
-initialise :: LSP.ClientCapabilities
-           -> Rules ()
-           -> IO LSP.LspId
-           -> (LSP.FromServerMessage -> IO ())
-           -> WithProgressFunc
-           -> WithIndefiniteProgressFunc
+initialise :: Rules ()
+           -> Maybe (LSP.LanguageContextEnv Config)
            -> Logger
            -> Debouncer LSP.NormalizedUri
            -> IdeOptions
            -> VFSHandle
+           -> HieDb
+           -> IndexQueue
            -> IO IdeState
-initialise caps mainRule getLspId toDiags wProg wIndefProg logger debouncer options vfs =
+initialise mainRule lspEnv logger debouncer options vfs hiedb hiedbChan =
     shakeOpen
-        getLspId
-        toDiags
-        wProg
-        wIndefProg
-        caps
+        lspEnv
         logger
         debouncer
         (optShakeProfiling options)
         (optReportProgress options)
         (optTesting options)
+        hiedb
+        hiedbChan
+        vfs
         (optShakeOptions options)
           $ do
             addIdeGlobal $ GlobalIdeOptions options
             fileStoreRules vfs
             ofInterestRules
-            fileExistsRules caps vfs
+            fileExistsRules lspEnv vfs
             mainRule
 
 writeProfile :: IdeState -> FilePath -> IO ()

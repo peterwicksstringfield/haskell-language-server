@@ -2,15 +2,15 @@
 module Highlight (tests) where
 
 import Control.Monad.IO.Class
-import Language.Haskell.LSP.Test
-import Language.Haskell.LSP.Types
+import Language.LSP.Test
+import Language.LSP.Types
 import Test.Hls.Util
 import Test.Tasty
 import Test.Tasty.HUnit
 
 tests :: TestTree
 tests = testGroup "highlight" [
-    testCase "works" $ runSession hlsCommand fullCaps "test/testdata" $ do
+    testCase "works" $ runSession (hlsCommand ++ " --test") fullCaps "test/testdata" $ do
         doc <- openDoc "Highlight.hs" "haskell"
         _ <- waitForDiagnosticsFrom doc
         highlights <- getHighlights doc (Position 2 2)
