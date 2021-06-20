@@ -2907,13 +2907,15 @@ addSigActionTests = let
     liftIO $ expectedCode @=? modifiedCode
   in
   testGroup "add signature"
-    [ "abc = True"              >:: "abc :: Bool"
-    , "foo a b = a + b"         >:: "foo :: Num a => a -> a -> a"
-    , "bar a b = show $ a + b"  >:: "bar :: (Show a, Num a) => a -> a -> String"
-    , "(!!!) a b = a > b"       >:: "(!!!) :: Ord a => a -> a -> Bool"
-    , "a >>>> b = a + b"        >:: "(>>>>) :: Num a => a -> a -> a"
-    , "a `haha` b = a b"        >:: "haha :: (t1 -> t2) -> t1 -> t2"
-    , "pattern Some a = Just a" >:: "pattern Some :: a -> Maybe a"
+    [ "abc = True"               >:: "abc :: Bool"
+    , "foo a b = a + b"          >:: "foo :: Num a => a -> a -> a"
+    , "bar a b = show $ a + b"   >:: "bar :: (Show a, Num a) => a -> a -> String"
+    , "(!!!) a b = a > b"        >:: "(!!!) :: Ord a => a -> a -> Bool"
+    , "a >>>> b = a + b"         >:: "(>>>>) :: Num a => a -> a -> a"
+    , "a `haha` b = a b"         >:: "haha :: (t1 -> t2) -> t1 -> t2"
+    , "pattern Some a = Just a"  >:: "pattern Some :: a -> Maybe a"
+    , expectFailBecause "unidirectional pattern synonym not supported" $
+      "pattern Some a <- Just a" >:: "pattern Some :: a -> Maybe a"
     ]
 
 exportUnusedTests :: TestTree
@@ -3426,6 +3428,8 @@ addSigLensesTests =
             [ sigSession "with GHC warnings" True "diagnostics" "" (second Just $ head cases) []
             , sigSession "without GHC warnings" False "diagnostics" "" (second (const Nothing) $ head cases) []
             ]
+        , expectFailBecause "unidirection pattern synonyms not supported" $
+          sigSession "pattern Some a <- Just a" False "always" "" ("pattern Some a <- Just a", Just "pattern Some :: a -> Maybe a") []
         ]
 
 linkToLocation :: [LocationLink] -> [Location]

@@ -21,7 +21,7 @@ import           Data.Aeson.Types                    (Value (..), toJSON)
 import qualified Data.Aeson.Types                    as A
 import qualified Data.HashMap.Strict                 as Map
 import           Data.List                           (find)
-import           Data.Maybe                          (catMaybes, fromJust)
+import           Data.Maybe                          (catMaybes)
 import qualified Data.Text                           as T
 import           Development.IDE                     (GhcSession (..),
                                                       HscEnvEq (hscEnv),
@@ -280,8 +280,10 @@ gblBindingType (Just hsc) (Just gblEnv) = do
       patToSig p = do
         let name = patSynName p
             -- we don't use pprPatSynType, since it always prints forall
-            ty = fromJust $ lookupTypeEnv (tcg_type_env gblEnv) name >>= safeTyThingType
-        hasSig name $ pure $ GlobalBindingTypeSig name ("pattern " <> printName name <> " :: " <> showDoc (pprSigmaType ty)) (name `elemNameSet` exports)
+            maybeTy = lookupTypeEnv (tcg_type_env gblEnv) name >>= safeTyThingType
+        case maybeTy of
+            Just ty -> hasSig name $ pure $ GlobalBindingTypeSig name ("pattern " <> printName name <> " :: " <> showDoc (pprSigmaType ty)) (name `elemNameSet` exports)
+            Nothing -> pure Nothing
   (_, maybe [] catMaybes -> bindings) <- initTcWithGbl hsc gblEnv (realSrcLocSpan $ mkRealSrcLoc "<dummy>" 1 1) $ mapM bindToSig binds
   patterns <- catMaybes <$> mapM patToSig patSyns
   pure . Just . GlobalBindingTypeSigsResult $ bindings <> patterns
